@@ -14,7 +14,13 @@ const {
 } = require('@discordjs/voice');
 const fs = require('fs');
 const spawn = require('child_process').spawn;
-const ffmpegPath = require('ffmpeg-static');
+const ffmpegStaticPath = require('ffmpeg-static');
+
+const ffmpegPath =
+    process.env.FFMPEG_PATH ||
+    ffmpegStaticPath;
+
+console.log(`🎬 FFmpeg utilizzato: ${ffmpegPath}`);
 const youtubeDl = require('youtube-dl-exec');
 const {
     buildMediaHub,
@@ -161,7 +167,7 @@ async function extractAudioInfo(input) {
 
         const source = exact || (
             info.http_headers &&
-            typeof info.http_headers === 'object'
+                typeof info.http_headers === 'object'
                 ? info
                 : null
         );
@@ -1364,7 +1370,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!hasHeader('Referer')) {
             requestHeaders['Referer'] =
                 playbackContext.sourceUrl &&
-                /^https?:\/\//i.test(playbackContext.sourceUrl)
+                    /^https?:\/\//i.test(playbackContext.sourceUrl)
                     ? playbackContext.sourceUrl
                     : 'https://www.youtube.com/';
         }
