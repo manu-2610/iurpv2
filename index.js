@@ -7,6 +7,9 @@ const {
     createAudioPlayer,
     createAudioResource,
     AudioPlayerStatus,
+    VoiceConnectionStatus,
+    entersState,
+    generateDependencyReport,
     StreamType
 } = require('@discordjs/voice');
 const fs = require('fs');
@@ -1048,17 +1051,68 @@ client.on(Events.InteractionCreate, async (interaction) => {
             });
         });
 
+        player.on('stateChange', (oldState, newState) => {
+            if (oldState.status !== newState.status) {
+                console.log(`[AUDIO ${guildId}] ${oldState.status} -> ${newState.status}`);
+            }
+        });
+
         player.on('error', err => {
             console.error(`❌ AudioPlayer error [${guildId}]:`, err);
         });
     }
 
-    function connectStateToVoiceChannel(s, voiceChannel, guild) {
+    function instrumentVoiceConnection(connection, guildId, label = 'voice') {
+        if (!connection || connection.__iurpDiagnosticsAttached) return connection;
+        connection.__iurpDiagnosticsAttached = true;
+
+        console.log(`[VOICE ${guildId}] ${label}: stato iniziale = ${connection.state.status}`);
+
+        connection.on('stateChange', (oldState, newState) => {
+            if (oldState.status !== newState.status) {
+                console.log(`[VOICE ${guildId}] ${label}: ${oldState.status} -> ${newState.status}`);
+            }
+        });
+
+        connection.on('error', err => {
+            console.error(
+                `[VOICE ${guildId}] ${label}: errore connessione:`,
+                err?.stack || err?.message || err
+            );
+        });
+
+        return connection;
+    }
+
+    async function waitForVoiceReady(connection, guildId, label = 'voice') {
+        instrumentVoiceConnection(connection, guildId, label);
+
+        if (connection.state.status === VoiceConnectionStatus.Ready) {
+            console.log(`[VOICE ${guildId}] ${label}: READY`);
+            return connection;
+        }
+
+        try {
+            await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+            console.log(`[VOICE ${guildId}] ${label}: READY`);
+            return connection;
+        } catch (err) {
+            const status = connection?.state?.status || 'unknown';
+            console.error(
+                `[VOICE ${guildId}] ${label}: NON ha raggiunto READY entro 20s. Stato finale: ${status}`
+            );
+            throw new Error(`Connessione vocale Discord non pronta (stato: ${status})`);
+        }
+    }
+
+    async function connectStateToVoiceChannel(s, voiceChannel, guild) {
         const connection = joinVoiceChannel({
             channelId: voiceChannel.id,
             guildId: guild.id,
             adapterCreator: guild.voiceAdapterCreator,
         });
+
+        await waitForVoiceReady(connection, guild.id, 'reconnect');
 
         connection.subscribe(s.player);
         s.connection = connection;
@@ -1088,6 +1142,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     guildId: guildId,
                     adapterCreator: interaction.guild.voiceAdapterCreator,
                 });
+
+                await waitForVoiceReady(connection, guildId, 'play');
+
                 connection.subscribe(player);
 
                 state = {
@@ -1107,7 +1164,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 await playResource(guildId, finalUrl, actualTitle, 0);
                 state.panelMessage = await interaction.editReply(createMusicPanel(actualTitle, interaction.user, false, state.filters, getPanelStatus(state), state));
             } else if (!state.current) {
-                connectStateToVoiceChannel(state, voiceChannel, interaction.guild);
+                await connectStateToVoiceChannel(state, voiceChannel, interaction.guild);
                 state.current = { url: finalUrl, title: actualTitle, channel: youtubeChannel, user: interaction.user };
                 state.textChannel = interaction.channel;
                 state.filters = { bassboost: false, nightcore: false, vaporwave: false, roulette: false };
@@ -1219,6 +1276,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         ffmpegProcess.stderr.on('data', chunk => {
             ffmpegError = (ffmpegError + chunk.toString()).slice(-4000);
+        });
+
+        ffmpegProcess.stdout.once('data', chunk => {
+            console.log(`[FFMPEG ${guildId}] primo PCM ricevuto: ${chunk.length} byte`);
         });
 
         ffmpegProcess.on('error', err => {
@@ -2535,6 +2596,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
                         guildId: guildId,
                         adapterCreator: interaction.guild.voiceAdapterCreator,
                     });
+
+                    await waitForVoiceReady(connection, guildId, 'roulette');
+
                     connection.subscribe(player);
 
                     state = {
@@ -2554,7 +2618,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     players.set(guildId, state);
                     attachPlayerListeners(player, guildId);
                 } else {
-                    connectStateToVoiceChannel(state, voiceCh, interaction.guild);
+                    await connectStateToVoiceChannel(state, voiceCh, interaction.guild);
                     state.textChannel = interaction.channel;
                     state.filters.roulette = true;
                     state.current = { url: finalUrl, title: actualTitle, channel: youtubeChannel, user: interaction.user };
@@ -2844,6 +2908,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 async function bootstrap() {
     console.log(`ℹ️ Node ${process.version}`);
+
+    try {
+        console.log('\n=== DISCORD VOICE DEPENDENCY REPORT ===');
+        console.log(generateDependencyReport());
+        console.log('=======================================\n');
+    } catch (err) {
+        console.warn(
+            'Impossibile generare il dependency report Discord Voice:',
+            err?.message || err
+        );
+    }
 
     // Node 22 può caricare nativamente .env: così funzionano sia `npm start`
     // sia `node .` da VS Code/PowerShell.
