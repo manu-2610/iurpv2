@@ -67,6 +67,27 @@ async function extractAudioInfo(input) {
             flags.cookies = './cookies.txt';
         }
 
+        // Railway / cloud: PO Token provider opzionale.
+        // In locale, senza POT_PROVIDER_URL, il comportamento resta invariato.
+        const potProviderUrl =
+            process.env.POT_PROVIDER_URL?.trim();
+
+        if (potProviderUrl) {
+            flags.pluginDirs = './yt-dlp-plugins';
+
+            // youtube-dl-exec converte gli array in flag ripetuti:
+            // --extractor-args youtube:player_client=mweb
+            // --extractor-args youtubepot-bgutilhttp:base_url=...
+            flags.extractorArgs = [
+                'youtube:player_client=mweb',
+                `youtubepot-bgutilhttp:base_url=${potProviderUrl}`
+            ];
+
+            if (process.env.YTDLP_DEBUG === '1') {
+                flags.verbose = true;
+            }
+        }
+
         return flags;
     }
 
@@ -671,6 +692,13 @@ async function extractAudioInfo(input) {
 }
 
 async function updateYtDlp() {
+    // Su Railway non aggiorniamo il binario a ogni boot:
+    // evita rate-limit GitHub e il build contiene giÃ  yt-dlp.
+    if (process.env.DISABLE_YTDLP_UPDATE === '1') {
+        console.log('â„¹ï¸ Auto-update yt-dlp disabilitato da ambiente.');
+        return;
+    }
+
     try {
         const result = await youtubeDl.update();
         const text = [result?.stdout, result?.stderr].filter(Boolean).join(' ').trim();
