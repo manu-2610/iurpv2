@@ -34,6 +34,10 @@ const dynamicText = require('./dynamic-text');
 // Alcuni flussi YouTube richiedono gli stessi header usati durante
 // l'estrazione; in cloud un URL nudo può chiudersi senza produrre audio.
 const streamPlaybackContext = new Map();
+
+// Protezione anti-rate-limit YouTube.
+const youtubeTargetCooldowns = new Map();
+let youtubeGlobalCooldownUntil = 0;
 const {
     MEDIA_ADMIN_COMMANDS,
     handleLibraryAdminAutocomplete,
@@ -50,16 +54,17 @@ async function extractAudioInfo(input) {
         ? 'Brano YouTube'
         : input.trim() || 'Brano YouTube';
 
-    function baseFlags() {
+    function baseFlags(mode = 'normal') {
         const flags = {
             noWarnings: true,
             jsRuntimes: 'node',
             remoteComponents: 'ejs:github',
 
-            // Rendiamo yt-dlp piu' tollerante ai problemi temporanei.
-            extractorRetries: 3,
-            retries: 3,
-            fragmentRetries: 3,
+            // Rendiamo yt-dlp tollerante ai problemi temporanei,
+            // senza moltiplicare i tentativi lato bot.
+            extractorRetries: 2,
+            retries: 2,
+            fragmentRetries: 2,
             socketTimeout: 20
         };
 
@@ -67,25 +72,23 @@ async function extractAudioInfo(input) {
             flags.cookies = './cookies.txt';
         }
 
-        // Railway / cloud: PO Token provider opzionale.
-        // In locale, senza POT_PROVIDER_URL, il comportamento resta invariato.
-        const potProviderUrl =
-            process.env.POT_PROVIDER_URL?.trim();
+        // SMART_YOUTUBE_FALLBACK_V2
+        // mweb + bgutil vengono usati SOLO nel fallback anti-bot/PO.
+        if (mode === 'pot') {
+            const potProviderUrl =
+                process.env.POT_PROVIDER_URL?.trim();
 
-        if (potProviderUrl) {
-            flags.pluginDirs = './yt-dlp-plugins';
-
-            // youtube-dl-exec converte gli array in flag ripetuti:
-            // --extractor-args youtube:player_client=mweb
-            // --extractor-args youtubepot-bgutilhttp:base_url=...
-            flags.extractorArgs = [
-                'youtube:player_client=mweb',
-                `youtubepot-bgutilhttp:base_url=${potProviderUrl}`
-            ];
-
-            if (process.env.YTDLP_DEBUG === '1') {
-                flags.verbose = true;
+            if (potProviderUrl) {
+                flags.pluginDirs = './yt-dlp-plugins';
+                flags.extractorArgs = [
+                    'youtube:player_client=mweb',
+                    `youtubepot-bgutilhttp:base_url=${potProviderUrl}`
+                ];
             }
+        }
+
+        if (process.env.YTDLP_DEBUG === '1') {
+            flags.verbose = true;
         }
 
         return flags;
@@ -303,144 +306,283 @@ async function extractAudioInfo(input) {
         ).trim();
     }
 
-    async function resolveTarget(
+    function getRelevantYtErrorLine(err) {
+        const lines =
+            getErrorText(err)
+                .split(/\r?\n/)
+                .map(line => line.trim())
+                .filter(Boolean);
+
+        return (
+            lines.find(line => /^ERROR:/i.test(line)) ||
+            lines.find(line =>
+                /LOGIN_REQUIRED|sign in to confirm|too many requests|HTTP Error 429|HTTP Error 403|forbidden|PO Token/i.test(line)
+            ) ||
+            lines.find(line => !line.startsWith('[debug]')) ||
+            lines[0] ||
+            'errore yt-dlp sconosciuto'
+        );
+    }
+
+    function classifyYtError(err) {
+        const text =
+            getErrorText(err)
+                .toLowerCase();
+
+        return {
+            rateLimited:
+                text.includes('http error 429') ||
+                text.includes('too many requests') ||
+                text.includes('rate limit'),
+
+            botCheck:
+                text.includes("sign in to confirm you're not a bot") ||
+                text.includes('sign in to confirm you’re not a bot') ||
+                text.includes('login_required') ||
+                text.includes('confirm you are not a bot'),
+
+            forbidden:
+                text.includes('http error 403') ||
+                text.includes('forbidden'),
+
+            poToken:
+                text.includes('po token') ||
+                text.includes('proof of origin') ||
+                text.includes('gvs'),
+
+            unavailable:
+                text.includes('video unavailable') ||
+                text.includes('this video is unavailable') ||
+                text.includes('video has been removed') ||
+                text.includes('this video has been removed') ||
+                text.includes('private video') ||
+                text.includes('account associated with this video has been terminated')
+        };
+    }
+
+    function getYoutubeCooldownKey(target) {
+        const text =
+            String(target || '');
+
+        const idMatch =
+            text.match(
+                /(?:v=|youtu\.be\/|shorts\/|embed\/)([A-Za-z0-9_-]{6,})/
+            );
+
+        return idMatch
+            ? `video:${idMatch[1]}`
+            : text.slice(0, 300);
+    }
+
+    function getYoutubeCooldownRemaining(target) {
+        const now =
+            Date.now();
+
+        if (youtubeGlobalCooldownUntil > now) {
+            return Math.ceil(
+                (youtubeGlobalCooldownUntil - now) / 1000
+            );
+        }
+
+        const key =
+            getYoutubeCooldownKey(target);
+
+        const until =
+            youtubeTargetCooldowns.get(key) || 0;
+
+        if (until <= now) {
+            youtubeTargetCooldowns.delete(key);
+            return 0;
+        }
+
+        return Math.ceil(
+            (until - now) / 1000
+        );
+    }
+
+    function applyYoutubeCooldown(target, err) {
+        const kind =
+            classifyYtError(err);
+
+        const now =
+            Date.now();
+
+        if (kind.rateLimited) {
+            youtubeGlobalCooldownUntil =
+                Math.max(
+                    youtubeGlobalCooldownUntil,
+                    now + 20_000
+                );
+        }
+
+        if (
+            kind.rateLimited ||
+            kind.botCheck
+        ) {
+            youtubeTargetCooldowns.set(
+                getYoutubeCooldownKey(target),
+                now + 180_000
+            );
+        }
+    }
+
+    function shouldTryPotFallback(err) {
+        if (!process.env.POT_PROVIDER_URL?.trim()) {
+            return false;
+        }
+
+        const kind =
+            classifyYtError(err);
+
+        if (kind.unavailable) {
+            return false;
+        }
+
+        return (
+            kind.botCheck ||
+            kind.rateLimited ||
+            kind.forbidden ||
+            kind.poToken
+        );
+    }
+
+    async function resolveTargetMode(
         target,
-        hints = {},
-        attempts = 1
+        hints,
+        mode
     ) {
         let lastError = null;
 
-        for (
-            let attempt = 1;
-            attempt <= attempts;
-            attempt++
-        ) {
+        const label =
+            mode === 'pot'
+                ? 'POT'
+                : 'NORMAL';
 
-            // ==================================================
-            // A) METADATI JSON
-            // ==================================================
-            //
-            // Proviamo prima il formato audio migliore.
-            // Poi accettiamo anche "best" audio+video.
-            //
-            // L'importante e' trovare un URL che FFmpeg possa
-            // aprire.
+        for (const format of [
+            'bestaudio/best',
+            'best'
+        ]) {
+            try {
+                const flags = {
+                    ...baseFlags(mode),
+                    dumpSingleJson: true,
+                    format,
+                    noPlaylist: true
+                };
 
-            for (const format of [
-                'bestaudio/best',
-                'best'
-            ]) {
-                try {
-                    const flags = {
-                        ...baseFlags(),
-                        dumpSingleJson: true,
-                        format,
-                        noPlaylist: true
-                    };
-
-                    const output =
-                        await youtubeDl(target, flags);
-
-                    const info =
-                        parseInfo(output);
-
-                    const result =
-                        normalizeResult(info, hints);
-
-                    if (result) {
-                        if (
-                            !info?.title ||
-                            !(info?.channel || info?.uploader)
-                        ) {
-                            console.warn(
-                                `[YT] Flusso trovato con metadati parziali: ${result.channel} - ${result.title}`
-                            );
-                        }
-
-                        return result;
-                    }
-
-                } catch (err) {
-                    lastError = err;
-
-                    console.warn(
-                        `[YT] JSON ${format} fallito ` +
-                        `(${attempt}/${attempts}): ` +
-                        getErrorText(err)
-                            .split(/\r?\n/)[0]
+                const output =
+                    await youtubeDl(
+                        target,
+                        flags
                     );
-                }
-            }
 
-            // ==================================================
-            // B) SOLO URL
-            // ==================================================
-            //
-            // Qui titolo, channel ecc. non ci interessano.
-            //
-            // Se yt-dlp riesce a fornirci un URL del flusso,
-            // NOI LO RIPRODUCIAMO.
+                const info =
+                    parseInfo(output);
 
-            for (const format of [
-                'bestaudio/best',
-                'best'
-            ]) {
-                try {
-                    const flags = {
-                        ...baseFlags(),
-                        getUrl: true,
-                        format,
-                        noPlaylist: true
-                    };
+                const result =
+                    normalizeResult(
+                        info,
+                        hints
+                    );
 
-                    const output =
-                        await youtubeDl(target, flags);
-
-                    const lines =
-                        String(output || '')
-                            .split(/\r?\n/)
-                            .map(line => line.trim())
-                            .filter(Boolean);
-
-                    const streamUrl =
-                        lines.find(line =>
-                            /^https?:\/\//i.test(line)
-                        );
-
-                    if (streamUrl) {
-                        const result =
-                            normalizeResult(
-                                null,
-                                hints,
-                                streamUrl
-                            );
-
+                if (result) {
+                    if (
+                        !info?.title ||
+                        !(info?.channel || info?.uploader)
+                    ) {
                         console.warn(
-                            `[YT] Fallback senza metadati completi: ` +
+                            `[YT ${label}] Flusso trovato con metadati parziali: ` +
                             `${result.channel} - ${result.title}`
                         );
-
-                        return result;
                     }
 
-                } catch (err) {
-                    lastError = err;
+                    return result;
+                }
 
-                    console.warn(
-                        `[YT] get-url ${format} fallito ` +
-                        `(${attempt}/${attempts}): ` +
-                        getErrorText(err)
-                            .split(/\r?\n/)[0]
-                    );
+            } catch (err) {
+                lastError = err;
+
+                console.warn(
+                    `[YT ${label}] JSON ${format} fallito: ` +
+                    getRelevantYtErrorLine(err)
+                );
+
+                const kind =
+                    classifyYtError(err);
+
+                if (
+                    kind.botCheck ||
+                    kind.rateLimited ||
+                    kind.unavailable
+                ) {
+                    throw err;
                 }
             }
+        }
 
-            // Piccola pausa prima di un secondo tentativo.
-            if (attempt < attempts) {
-                await new Promise(
-                    resolve =>
-                        setTimeout(resolve, 750)
+        for (const format of [
+            'bestaudio/best',
+            'best'
+        ]) {
+            try {
+                const flags = {
+                    ...baseFlags(mode),
+                    getUrl: true,
+                    format,
+                    noPlaylist: true
+                };
+
+                const output =
+                    await youtubeDl(
+                        target,
+                        flags
+                    );
+
+                const lines =
+                    String(output || '')
+                        .split(/\r?\n/)
+                        .map(line => line.trim())
+                        .filter(Boolean);
+
+                const streamUrl =
+                    lines.find(line =>
+                        /^https?:\/\//i.test(line)
+                    );
+
+                if (streamUrl) {
+                    const result =
+                        normalizeResult(
+                            null,
+                            hints,
+                            streamUrl
+                        );
+
+                    console.warn(
+                        `[YT ${label}] Fallback senza metadati completi: ` +
+                        `${result.channel} - ${result.title}`
+                    );
+
+                    return result;
+                }
+
+            } catch (err) {
+                lastError = err;
+
+                console.warn(
+                    `[YT ${label}] get-url ${format} fallito: ` +
+                    getRelevantYtErrorLine(err)
                 );
+
+                const kind =
+                    classifyYtError(err);
+
+                if (
+                    kind.botCheck ||
+                    kind.rateLimited ||
+                    kind.unavailable
+                ) {
+                    throw err;
+                }
             }
         }
 
@@ -449,6 +591,120 @@ async function extractAudioInfo(input) {
             new Error(
                 'Nessun flusso riproducibile trovato.'
             )
+        );
+    }
+
+    async function resolveTarget(
+        target,
+        hints = {},
+        attempts = 1
+    ) {
+        const cooldown =
+            getYoutubeCooldownRemaining(
+                target
+            );
+
+        if (cooldown > 0) {
+            throw new Error(
+                `YouTube e' temporaneamente in cooldown per questo contenuto. ` +
+                `Riprova tra circa ${cooldown}s.`
+            );
+        }
+
+        let normalError = null;
+
+        const normalAttempts =
+            Math.max(
+                1,
+                Math.min(
+                    Number(attempts) || 1,
+                    2
+                )
+            );
+
+        for (
+            let attempt = 1;
+            attempt <= normalAttempts;
+            attempt++
+        ) {
+            try {
+                return await resolveTargetMode(
+                    target,
+                    hints,
+                    'normal'
+                );
+
+            } catch (err) {
+                normalError = err;
+
+                const kind =
+                    classifyYtError(err);
+
+                if (
+                    kind.unavailable ||
+                    shouldTryPotFallback(err) ||
+                    kind.botCheck ||
+                    kind.rateLimited
+                ) {
+                    break;
+                }
+
+                if (attempt < normalAttempts) {
+                    await new Promise(
+                        resolve =>
+                            setTimeout(
+                                resolve,
+                                650
+                            )
+                    );
+                }
+            }
+        }
+
+        if (
+            normalError &&
+            shouldTryPotFallback(
+                normalError
+            )
+        ) {
+            console.warn(
+                `[YT] Fallback PO Token attivato: ` +
+                getRelevantYtErrorLine(normalError)
+            );
+
+            try {
+                return await resolveTargetMode(
+                    target,
+                    hints,
+                    'pot'
+                );
+
+            } catch (potError) {
+                applyYoutubeCooldown(
+                    target,
+                    potError
+                );
+
+                console.warn(
+                    `[YT POT] fallback fallito: ` +
+                    getRelevantYtErrorLine(potError)
+                );
+
+                throw potError;
+            }
+        }
+
+        if (normalError) {
+            applyYoutubeCooldown(
+                target,
+                normalError
+            );
+
+            throw normalError;
+        }
+
+        throw new Error(
+            'Nessun flusso riproducibile trovato.'
         );
     }
 
@@ -586,11 +842,32 @@ async function extractAudioInfo(input) {
                 .filter(Boolean);
 
     } catch (err) {
+        const kind =
+            classifyYtError(err);
+
         console.warn(
-            `[YT] Ricerca multipla fallita. ` +
-            `Provo comunque ytsearch1: ` +
-            getErrorText(err)
-                .split(/\r?\n/)[0]
+            `[YT] Ricerca multipla fallita: ` +
+            getRelevantYtErrorLine(err)
+        );
+
+        if (
+            kind.botCheck ||
+            kind.rateLimited
+        ) {
+            applyYoutubeCooldown(
+                `search:${input}`,
+                err
+            );
+
+            throw new Error(
+                `YouTube sta limitando temporaneamente le richieste di ricerca. ` +
+                `Riprova tra poco. Dettaglio: ` +
+                getRelevantYtErrorLine(err)
+            );
+        }
+
+        console.warn(
+            '[YT] Provo comunque ytsearch1.'
         );
     }
 
@@ -960,7 +1237,13 @@ client.once(Events.ClientReady, async () => {
 
         try {
 
-            await refreshMediaTitles();
+            if (process.env.POT_PROVIDER_URL) {
+                console.log(
+                    '[MEDIA HUB] Refresh titoli startup saltato in cloud per ridurre il rate-limit YouTube.'
+                );
+            } else {
+                await refreshMediaTitles();
+            }
 
         } catch (titleErr) {
 

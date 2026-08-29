@@ -23,6 +23,16 @@ const TITLES_PATH =
         'media-titles.json'
     );
 
+// MEDIA_TITLE_FAILURE_CACHE_V2
+const TITLE_FAILURES_PATH =
+    path.join(
+        __dirname,
+        'media-title-failures.json'
+    );
+
+const TITLE_FAILURE_TTL_MS =
+    6 * 60 * 60 * 1000;
+
 let titleRefreshPromise = null;
 
 
@@ -94,6 +104,101 @@ function saveTitleCache(cache) {
             err.message
         );
     }
+}
+
+
+function loadTitleFailureCache() {
+    try {
+        if (!fs.existsSync(TITLE_FAILURES_PATH)) return {};
+
+        const parsed =
+            JSON.parse(
+                fs.readFileSync(
+                    TITLE_FAILURES_PATH,
+                    'utf8'
+                )
+            );
+
+        return (
+            parsed &&
+            typeof parsed === 'object'
+        )
+            ? parsed
+            : {};
+
+    } catch (err) {
+        console.warn(
+            '[MEDIA HUB] Errore lettura media-title-failures.json:',
+            err.message
+        );
+        return {};
+    }
+}
+
+
+function saveTitleFailureCache(cache) {
+    try {
+        fs.writeFileSync(
+            TITLE_FAILURES_PATH,
+            JSON.stringify(cache, null, 2) + '\n',
+            'utf8'
+        );
+    } catch (err) {
+        console.warn(
+            '[MEDIA HUB] Errore salvataggio media-title-failures.json:',
+            err.message
+        );
+    }
+}
+
+
+function canAttemptMediaTitle(
+    itemId,
+    force = false
+) {
+    if (force) return true;
+
+    const cache =
+        loadTitleFailureCache();
+
+    const nextRetryAt =
+        Number(
+            cache[itemId]?.nextRetryAt || 0
+        );
+
+    return (
+        !Number.isFinite(nextRetryAt) ||
+        nextRetryAt <= Date.now()
+    );
+}
+
+
+function markMediaTitleFailure(itemId) {
+    const cache =
+        loadTitleFailureCache();
+
+    const failedAt =
+        Date.now();
+
+    cache[itemId] = {
+        failedAt,
+        nextRetryAt:
+            failedAt +
+            TITLE_FAILURE_TTL_MS
+    };
+
+    saveTitleFailureCache(cache);
+}
+
+
+function clearMediaTitleFailure(itemId) {
+    const cache =
+        loadTitleFailureCache();
+
+    if (!cache[itemId]) return;
+
+    delete cache[itemId];
+    saveTitleFailureCache(cache);
 }
 
 
@@ -240,24 +345,50 @@ async function fetchTitleWithYtDlp(item) {
 
 
 async function fetchRealYoutubeTitle(item) {
-
-    // Metodo leggero e molto rapido.
+    // Prima oEmbed: leggero e senza avviare yt-dlp.
     let title =
         await fetchTitleWithOEmbed(
             item
         );
 
     if (title) {
+        clearMediaTitleFailure(
+            item.id
+        );
         return title;
     }
 
-    // Fallback piu' robusto.
+    // Su Railway non lanciamo yt-dlp per ogni titolo mancante:
+    // protegge l'IP cloud dai rate-limit. Si puo' riabilitare
+    // esplicitamente con MEDIA_TITLE_YTDLP_FALLBACK=1.
+    const allowYtDlpFallback =
+        !process.env.POT_PROVIDER_URL ||
+        process.env.MEDIA_TITLE_YTDLP_FALLBACK === '1';
+
+    if (!allowYtDlpFallback) {
+        markMediaTitleFailure(
+            item.id
+        );
+        return '';
+    }
+
     title =
         await fetchTitleWithYtDlp(
             item
         );
 
-    return title;
+    if (title) {
+        clearMediaTitleFailure(
+            item.id
+        );
+        return title;
+    }
+
+    markMediaTitleFailure(
+        item.id
+    );
+
+    return '';
 }
 
 
@@ -282,9 +413,15 @@ async function refreshMediaTitles({
             const missing =
                 getLibraryCatalog().filter(
                     item =>
-                        force ||
-                        !cleanYoutubeTitle(
-                            cache[item.id]
+                        (
+                            force ||
+                            !cleanYoutubeTitle(
+                                cache[item.id]
+                            )
+                        ) &&
+                        canAttemptMediaTitle(
+                            item.id,
+                            force
                         )
                 );
 
@@ -353,12 +490,23 @@ async function refreshMediaTitles({
                 }
             };
 
-            await Promise.all([
-                worker(),
-                worker(),
-                worker(),
-                worker()
-            ]);
+            const workerCount =
+                process.env.POT_PROVIDER_URL
+                    ? 1
+                    : 2;
+
+            await Promise.all(
+                Array.from(
+                    {
+                        length:
+                            Math.min(
+                                workerCount,
+                                missing.length
+                            )
+                    },
+                    () => worker()
+                )
+            );
 
             saveTitleCache(
                 cache
