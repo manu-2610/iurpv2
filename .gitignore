@@ -1,0 +1,23 @@
+# Dipendenze
+node_modules/
+
+# Segreti
+.env
+token.env
+cookies.txt
+cookies.json
+*.pem
+*.key
+
+# Backup / fix locali
+backup*/
+*.backup*.js
+fix.ps1
+fix_*.ps1
+media-backups/
+
+# Log / file inutili
+npm-debug.log*
+*.log
+.DS_Store
+Thumbs.db

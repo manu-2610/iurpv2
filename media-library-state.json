@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "customVideos": [
+    {
+      "id": "bello-figo-andrea-dipre",
+      "title": "Bello Figo - Andrea Diprè",
+      "emoji": "👔",
+      "url": "https://www.youtube.com/watch?v=uqwcDuQeWsE",
+      "aliases": [
+        "bello-figo-andrea-dipre"
+      ],
+      "categories": [
+        "bello-figo"
+      ],
+      "start": 0,
+      "featuredRank": 9999,
+      "custom": true
+    },
+    {
+      "id": "bello-figo-non-pago-affitto",
+      "title": "Bello Figo - Non Pago Affitto",
+      "emoji": "💲",
+      "url": "https://www.youtube.com/watch?v=ookGv44MMd4",
+      "aliases": [
+        "bello-figo-non-pago-affitto"
+      ],
+      "categories": [
+        "bello-figo"
+      ],
+      "start": 0,
+      "featuredRank": 9999,
+      "custom": true
+    },
+    {
+      "id": "bello-figo-pasta-con-tonno",
+      "title": "Bello Figo - Pasta Con Tonno",
+      "emoji": "🐟",
+      "url": "https://www.youtube.com/watch?v=D4MQZ-C2xZE",
+      "aliases": [
+        "bello-figo-pasta-con-tonno"
+      ],
+      "categories": [
+        "bello-figo"
+      ],
+      "start": 0,
+      "featuredRank": 9999,
+      "custom": true
+    },
+    {
+      "id": "bello-figo-avvofatto-i-m-in-love-with-the-coco",
+      "title": "Bello Figo & Avvofatto - I'm In Love With The Coco",
+      "emoji": "❄️",
+      "url": "https://www.youtube.com/watch?v=HCVlt68EmdE",
+      "aliases": [
+        "bello-figo-avvofatto-i-m-in-love-with-the-coco"
+      ],
+      "categories": [
+        "bello-figo"
+      ],
+      "start": 0,
+      "featuredRank": 9999,
+      "custom": true
+    }
+  ],
+  "videoOverrides": {
+    "bobbe": {
+      "categories": [
+        "cult",
+        "dipre"
+      ]
+    },
+    "clown": {
+      "categories": [
+        "cult"
+      ]
+    },
+    "nikita": {
+      "categories": [
+        "cult",
+        "dipre"
+      ]
+    },
+    "obambaoplomo": {
+      "categories": [
+        "cult"
+      ]
+    },
+    "petolicchio": {
+      "categories": [
+        "cult"
+      ]
+    },
+    "ollare": {
+      "categories": [
+        "musica"
+      ]
+    }
+  },
+  "hiddenVideoIds": [],
+  "customCategories": {
+    "bello-figo": {
+      "label": "Bello Figo",
+      "emoji": "😎"
+    }
+  },
+  "categoryOverrides": {},
+  "hiddenCategoryIds": [],
+  "categoryOrder": [
+    "popular",
+    "malgioglio",
+    "dipre",
+    "algero",
+    "musica",
+    "cult",
+    "bello-figo",
+    "all"
+  ]
+}
