@@ -5,7 +5,7 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
     "check": "node --check index.js",
     "update:ytdlp": "node -e \"require('youtube-dl-exec').update().then(r => console.log(r.stdout || 'yt-dlp aggiornato')).catch(e => { console.error(e.stderr || e.message); process.exit(1) })\""
   },
