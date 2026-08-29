@@ -1,12 +1,13 @@
 const fs = require('fs');
 const path = require('path');
+const { getDataDir, getDataPath } = require('./runtime-data');
 
-const ROOT = __dirname;
-const STATE_PATH = path.join(ROOT, 'media-library-state.json');
-const AUDIT_PATH = path.join(ROOT, 'media-audit.json');
-const STATS_PATH = path.join(ROOT, 'media-stats.json');
-const TITLES_PATH = path.join(ROOT, 'media-titles.json');
-const BACKUP_DIR = path.join(ROOT, 'media-backups');
+const ROOT = getDataDir();
+const STATE_PATH = getDataPath('media-library-state.json');
+const AUDIT_PATH = getDataPath('media-audit.json');
+const STATS_PATH = getDataPath('media-stats.json');
+const TITLES_PATH = getDataPath('media-titles.json');
+const BACKUP_DIR = getDataPath('media-backups');
 
 const PROTECTED_CATEGORY_IDS = new Set(['popular', 'all']);
 

@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { getDataPath } = require('./runtime-data');
 const youtubeDl = require('youtube-dl-exec');
 const libraryStore = require('./media-library-store');
 
@@ -12,23 +13,15 @@ const {
     StringSelectMenuOptionBuilder
 } = require('discord.js');
 
-const STATS_PATH = path.join(__dirname, 'media-stats.json');
+const STATS_PATH = getDataPath('media-stats.json');
 // ============================================================
 // REAL_YOUTUBE_TITLE_CACHE
 // ============================================================
 
-const TITLES_PATH =
-    path.join(
-        __dirname,
-        'media-titles.json'
-    );
+const TITLES_PATH = getDataPath('media-titles.json');
 
 // MEDIA_TITLE_FAILURE_CACHE_V2
-const TITLE_FAILURES_PATH =
-    path.join(
-        __dirname,
-        'media-title-failures.json'
-    );
+const TITLE_FAILURES_PATH = getDataPath('media-title-failures.json');
 
 const TITLE_FAILURE_TTL_MS =
     6 * 60 * 60 * 1000;
