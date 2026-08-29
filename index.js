@@ -23,6 +23,11 @@ const {
     refreshMediaTitles
 } = require('./media-hub');
 const dynamicText = require('./dynamic-text');
+
+// Conserva il contesto HTTP restituito da yt-dlp per ogni URL CDN.
+// Alcuni flussi YouTube richiedono gli stessi header usati durante
+// l'estrazione; in cloud un URL nudo può chiudersi senza produrre audio.
+const streamPlaybackContext = new Map();
 const {
     MEDIA_ADMIN_COMMANDS,
     handleLibraryAdminAutocomplete,
@@ -135,6 +140,52 @@ async function extractAudioInfo(input) {
         return null;
     }
 
+    function getHttpHeadersForStream(info, selectedUrl) {
+        if (!info || !selectedUrl) return null;
+
+        const candidates = [
+            info,
+            ...(Array.isArray(info.requested_downloads) ? info.requested_downloads : []),
+            ...(Array.isArray(info.requested_formats) ? info.requested_formats : []),
+            ...(Array.isArray(info.formats) ? info.formats : [])
+        ];
+
+        // Preferiamo gli header del formato che possiede esattamente
+        // l'URL che poi passeremo a FFmpeg.
+        const exact = candidates.find(candidate =>
+            candidate &&
+            candidate.url === selectedUrl &&
+            candidate.http_headers &&
+            typeof candidate.http_headers === 'object'
+        );
+
+        const source = exact || (
+            info.http_headers &&
+            typeof info.http_headers === 'object'
+                ? info
+                : null
+        );
+
+        if (!source?.http_headers) return null;
+
+        const headers = {};
+
+        for (const [key, value] of Object.entries(source.http_headers)) {
+            if (value == null) continue;
+
+            const cleanKey = String(key).replace(/[\r\n:]/g, '').trim();
+            const cleanValue = String(value).replace(/[\r\n]+/g, ' ').trim();
+
+            if (cleanKey && cleanValue) {
+                headers[cleanKey] = cleanValue;
+            }
+        }
+
+        return Object.keys(headers).length
+            ? headers
+            : null;
+    }
+
     function normalizeResult(
         info,
         hints = {},
@@ -181,6 +232,35 @@ async function extractAudioInfo(input) {
             album: info?.album || hints.album || null,
             categories: info?.categories || hints.categories || null
         };
+
+        const httpHeaders =
+            getHttpHeadersForStream(
+                info,
+                url
+            );
+
+        const playbackContext = {
+            httpHeaders,
+            sourceUrl:
+                sourceUrl ||
+                hints.sourceUrl ||
+                null,
+            createdAt: Date.now()
+        };
+
+        streamPlaybackContext.set(
+            url,
+            playbackContext
+        );
+
+        // Evita che la Map cresca indefinitamente su un bot 24/7.
+        while (streamPlaybackContext.size > 250) {
+            const oldestKey =
+                streamPlaybackContext.keys().next().value;
+
+            if (!oldestKey) break;
+            streamPlaybackContext.delete(oldestKey);
+        }
 
         dynamicText.rememberMetadata(result);
         return result;
@@ -1258,12 +1338,80 @@ client.on(Events.InteractionCreate, async (interaction) => {
             }
         }
 
+        const playbackContext =
+            streamPlaybackContext.get(url) ||
+            {};
+
+        const requestHeaders = {
+            ...(playbackContext.httpHeaders || {})
+        };
+
+        const hasHeader = name =>
+            Object.keys(requestHeaders)
+                .some(key =>
+                    key.toLowerCase() === name.toLowerCase()
+                );
+
+        // yt-dlp normalmente fornisce gia' User-Agent e altri header.
+        // Questi fallback servono soprattutto per il percorso get-url.
+        if (!hasHeader('User-Agent')) {
+            requestHeaders['User-Agent'] =
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                'Chrome/151.0.0.0 Safari/537.36';
+        }
+
+        if (!hasHeader('Referer')) {
+            requestHeaders['Referer'] =
+                playbackContext.sourceUrl &&
+                /^https?:\/\//i.test(playbackContext.sourceUrl)
+                    ? playbackContext.sourceUrl
+                    : 'https://www.youtube.com/';
+        }
+
+        const headerBlob =
+            Object.entries(requestHeaders)
+                .filter(([key]) =>
+                    !['host', 'content-length', 'range']
+                        .includes(key.toLowerCase())
+                )
+                .map(([key, value]) =>
+                    `${key}: ${String(value).replace(/[\r\n]+/g, ' ')}\r\n`
+                )
+                .join('');
+
         const ffmpegArgs = [
-            '-hide_banner', '-loglevel', 'error',
-            '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+            '-hide_banner', '-loglevel', 'warning'
+        ];
+
+        if (headerBlob) {
+            ffmpegArgs.push(
+                '-headers',
+                headerBlob
+            );
+        }
+
+        ffmpegArgs.push(
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
             '-ss', s.currentSeek.toString(),
             '-i', url
-        ];
+        );
+
+        try {
+            const inputHost =
+                new URL(url).hostname;
+
+            console.log(
+                `[FFMPEG ${guildId}] input=${inputHost} ` +
+                `headers=${Object.keys(requestHeaders).join(',') || 'nessuno'}`
+            );
+        } catch {
+            console.log(
+                `[FFMPEG ${guildId}] input URL non analizzabile`
+            );
+        }
 
         if (filterArgs.length > 0) {
             ffmpegArgs.push('-af', filterArgs.join(','));
@@ -1275,24 +1423,49 @@ client.on(Events.InteractionCreate, async (interaction) => {
         let ffmpegError = '';
 
         ffmpegProcess.stderr.on('data', chunk => {
-            ffmpegError = (ffmpegError + chunk.toString()).slice(-4000);
-        });
+            const text =
+                chunk.toString();
 
-        ffmpegProcess.stdout.once('data', chunk => {
-            console.log(`[FFMPEG ${guildId}] primo PCM ricevuto: ${chunk.length} byte`);
+            ffmpegError =
+                (ffmpegError + text)
+                    .slice(-6000);
         });
 
         ffmpegProcess.on('error', err => {
             console.error('❌ Impossibile avviare FFmpeg:', err);
         });
 
-        ffmpegProcess.on('close', code => {
+        ffmpegProcess.on('close', (code, signal) => {
             if (s.process === ffmpegProcess) {
                 s.process = null;
             }
 
-            if (code && !ffmpegProcess.killed) {
-                console.error(`❌ FFmpeg terminato con codice ${code}${ffmpegError ? `: ${ffmpegError.trim()}` : ''}`);
+            const stderrText =
+                ffmpegError.trim();
+
+            console.log(
+                `[FFMPEG ${guildId}] chiuso: ` +
+                `code=${code ?? 'null'} ` +
+                `signal=${signal || 'none'} ` +
+                `killed=${ffmpegProcess.killed}`
+            );
+
+            if (
+                stderrText &&
+                !ffmpegProcess.killed
+            ) {
+                console.warn(
+                    `[FFMPEG ${guildId}] stderr: ${stderrText}`
+                );
+            }
+
+            if (
+                code &&
+                !ffmpegProcess.killed
+            ) {
+                console.error(
+                    `❌ FFmpeg terminato con codice ${code}`
+                );
             }
         });
 
