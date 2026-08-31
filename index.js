@@ -127,6 +127,88 @@ function registerYoutubePlayerSuccess() {
     youtubeCircuitBackoffMs = 120_000;
 }
 
+
+// ZERO_COST_V3_4_ADAPTIVE_FASTPATH
+let youtubeSpoolFastPathUntil = 0;
+
+function getYoutubeSpoolFastPathMs() {
+    const configuredMinutes =
+        Number(
+            process.env.YTDLP_FASTPATH_MINUTES
+        );
+
+    const minutes =
+        Number.isFinite(configuredMinutes) &&
+        configuredMinutes > 0
+            ? Math.min(
+                configuredMinutes,
+                60
+            )
+            : 10;
+
+    return Math.max(
+        60_000,
+        Math.round(
+            minutes * 60_000
+        )
+    );
+}
+
+function isYoutubeSpoolFastPathActive() {
+    if (
+        youtubeSpoolFastPathUntil <=
+        Date.now()
+    ) {
+        youtubeSpoolFastPathUntil = 0;
+        return false;
+    }
+
+    return true;
+}
+
+function activateYoutubeSpoolFastPath(reason = '') {
+    const duration =
+        getYoutubeSpoolFastPathMs();
+
+    const wasActive =
+        isYoutubeSpoolFastPathActive();
+
+    youtubeSpoolFastPathUntil =
+        Date.now() +
+        duration;
+
+    if (!wasActive) {
+        console.warn(
+            `[YT FASTPATH] SPOOL preferito per ` +
+            `${Math.ceil(duration / 60_000)} min` +
+            (
+                reason
+                    ? `: ${reason}`
+                    : '.'
+            )
+        );
+    }
+}
+
+function clearYoutubeSpoolFastPath(reason = '') {
+    if (
+        !youtubeSpoolFastPathUntil
+    ) {
+        return;
+    }
+
+    youtubeSpoolFastPathUntil = 0;
+
+    console.log(
+        `[YT FASTPATH] disattivato` +
+        (
+            reason
+                ? `: ${reason}`
+                : '.'
+        )
+    );
+}
+
 async function extractAudioInfo(input) {
     const isDirectUrl = /^https?:\/\//i.test(input);
 
@@ -703,32 +785,99 @@ async function extractAudioInfo(input) {
     }
 
     function buildFallbackModes(err) {
-        const kind = classifyYtError(err);
+        const kind =
+            classifyYtError(err);
 
-        if (kind.unavailable) return [];
-
-        if (kind.rateLimited && !kind.botCheck) {
+        if (kind.unavailable) {
             return [];
         }
 
+        // Un 429 puro indica rate-limit dell'IP:
+        // non aumentiamo le richieste.
+        if (
+            kind.rateLimited &&
+            !kind.botCheck
+        ) {
+            return [];
+        }
+
+        const directProblem =
+            kind.botCheck ||
+            kind.forbidden ||
+            kind.poToken;
+
+        // V3.4: se abbiamo cookie, AUTH resta l'unico
+        // fallback diretto "primario". Se fallisce,
+        // proviamo subito lo spool, che abbiamo verificato
+        // essere piu' affidabile dei client esotici.
+        if (
+            directProblem &&
+            modeIsAvailable('auth')
+        ) {
+            if (
+                isYoutubeSpoolFastPathActive()
+            ) {
+                console.warn(
+                    '[YT FASTPATH] egress degradato gia noto: ' +
+                    'salto i fallback direct secondari e provo SPOOL.'
+                );
+
+                return [];
+            }
+
+            return [
+                'auth'
+            ];
+        }
+
+        // Senza cookie non possiamo usare SPOOL AUTH:
+        // conserviamo la vecchia rete di fallback direct.
         const modes = [];
 
         if (
-            (kind.botCheck || kind.forbidden || kind.poToken) &&
-            modeIsAvailable('auth')
+            kind.botCheck ||
+            kind.forbidden ||
+            kind.poToken
         ) {
-            modes.push('auth', 'authEmbedded');
+            if (
+                modeIsAvailable(
+                    'authEmbedded'
+                )
+            ) {
+                modes.push(
+                    'authEmbedded'
+                );
+            }
+
+            if (
+                modeIsAvailable(
+                    'authPot'
+                )
+            ) {
+                modes.push(
+                    'authPot'
+                );
+            }
+
+            if (
+                modeIsAvailable(
+                    'pot'
+                )
+            ) {
+                modes.push(
+                    'pot'
+                );
+            }
+
+            modes.push(
+                'webSafari',
+                'androidVr'
+            );
         }
 
-        if (kind.botCheck || kind.forbidden || kind.poToken) {
-            if (modeIsAvailable('authPot')) modes.push('authPot');
-            if (modeIsAvailable('pot')) modes.push('pot');
-
-            // Emergency fallbacks: ultimi, per non aumentare richieste inutili.
-            modes.push('webSafari', 'androidVr');
-        }
-
-        return [...new Set(modes)];
+        return [
+            ...new Set(modes)
+        ];
     }
 
     // ZERO_COST_V3_2_VERIFIED_STREAM
@@ -851,6 +1000,10 @@ async function extractAudioInfo(input) {
                 result.url,
                 info,
                 mode
+            );
+
+            clearYoutubeSpoolFastPath(
+                `${label} direct verificato`
             );
 
             console.log(
@@ -1240,6 +1393,9 @@ async function extractAudioInfo(input) {
         hints = {},
         cause = null
     ) {
+        const fastPathWasActive =
+            isYoutubeSpoolFastPathActive();
+
         const kind =
             classifyYtError(
                 cause
@@ -1436,6 +1592,10 @@ async function extractAudioInfo(input) {
                     result
                 );
 
+                activateYoutubeSpoolFastPath(
+                    `${label} spool riuscito dopo errore direct`
+                );
+
                 return result;
 
             } catch (err) {
@@ -1453,15 +1613,88 @@ async function extractAudioInfo(input) {
             }
         }
 
+        // Se anche lo spool non riesce, NON perdiamo
+        // la ridondanza V3.2: i client direct secondari
+        // vengono provati solo a questo punto.
+        const extendedModes = [
+            ...(
+                fastPathWasActive &&
+                modeIsAvailable('auth')
+                    ? ['auth']
+                    : []
+            ),
+            ...(
+                modeIsAvailable('authEmbedded')
+                    ? ['authEmbedded']
+                    : []
+            ),
+            ...(
+                modeIsAvailable('authPot')
+                    ? ['authPot']
+                    : []
+            ),
+            ...(
+                modeIsAvailable('pot')
+                    ? ['pot']
+                    : []
+            ),
+            'webSafari',
+            'androidVr'
+        ];
+
+        for (
+            const directMode of [
+                ...new Set(extendedModes)
+            ]
+        ) {
+            try {
+                console.warn(
+                    `[YT FASTPATH] SPOOL fallito: ` +
+                    `ultima rete direct ${modeLabel(directMode)}.`
+                );
+
+                const recovered =
+                    await resolveTargetMode(
+                        target,
+                        hints,
+                        directMode
+                    );
+
+                clearYoutubeSpoolFastPath(
+                    `fallback ${modeLabel(directMode)} nuovamente utilizzabile`
+                );
+
+                return recovered;
+
+            } catch (err) {
+                lastError =
+                    err;
+
+                const directKind =
+                    classifyYtError(
+                        err
+                    );
+
+                if (
+                    directKind.unavailable ||
+                    (
+                        directKind.rateLimited &&
+                        !directKind.botCheck
+                    )
+                ) {
+                    break;
+                }
+            }
+        }
+
         throw (
             lastError ||
             cause ||
             new Error(
-                'Tutti i fallback spool sono falliti.'
+                'Tutti i fallback spool/direct sono falliti.'
             )
         );
     }
-
     async function resolveTarget(
         target,
         hints = {},
@@ -1537,6 +1770,24 @@ async function extractAudioInfo(input) {
                     break;
                 }
             }
+        }
+
+        const beforeSpoolKind =
+            classifyYtError(
+                lastError
+            );
+
+        if (
+            (
+                beforeSpoolKind.botCheck ||
+                beforeSpoolKind.forbidden ||
+                beforeSpoolKind.poToken
+            ) &&
+            modeIsAvailable('auth')
+        ) {
+            console.warn(
+                '[YT FASTPATH] direct primario esaurito: provo SPOOL prima dei fallback secondari.'
+            );
         }
 
         try {
