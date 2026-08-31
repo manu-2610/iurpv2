@@ -1044,7 +1044,18 @@ async function extractAudioInfo(input) {
                     '--format',
                     'bestaudio/best',
                     '--output',
-                    outputPath
+                    outputPath,
+                    '--no-simulate',
+                    '--print',
+                    'after_move:__IURP_TITLE__%(title)s',
+                    '--print',
+                    'after_move:__IURP_CHANNEL__%(channel)s',
+                    '--print',
+                    'after_move:__IURP_UPLOADER__%(uploader)s',
+                    '--print',
+                    'after_move:__IURP_DURATION__%(duration)s',
+                    '--print',
+                    'after_move:__IURP_WEBPAGE__%(webpage_url)s'
                 ];
 
                 if (
@@ -1185,6 +1196,45 @@ async function extractAudioInfo(input) {
         );
     }
 
+
+    // ZERO_COST_V3_3_2_SPOOL_METADATA
+    function parseSpoolMetadata(stdout) {
+        const metadata = {};
+
+        for (const rawLine of String(stdout || '').split(/\r?\n/)) {
+            const line = rawLine.trim();
+
+            if (line.startsWith('__IURP_TITLE__')) {
+                metadata.title =
+                    line.slice('__IURP_TITLE__'.length).trim() || null;
+            } else if (line.startsWith('__IURP_CHANNEL__')) {
+                metadata.channel =
+                    line.slice('__IURP_CHANNEL__'.length).trim() || null;
+            } else if (line.startsWith('__IURP_UPLOADER__')) {
+                metadata.uploader =
+                    line.slice('__IURP_UPLOADER__'.length).trim() || null;
+            } else if (line.startsWith('__IURP_DURATION__')) {
+                const duration =
+                    Number(line.slice('__IURP_DURATION__'.length).trim());
+
+                metadata.duration =
+                    Number.isFinite(duration) && duration > 0
+                        ? duration
+                        : null;
+            } else if (line.startsWith('__IURP_WEBPAGE__')) {
+                const webpageUrl =
+                    line.slice('__IURP_WEBPAGE__'.length).trim();
+
+                metadata.webpageUrl =
+                    /^https?:\/\//i.test(webpageUrl)
+                        ? webpageUrl
+                        : null;
+            }
+        }
+
+        return metadata;
+    }
+
     async function resolveSpoolFallback(
         target,
         hints = {},
@@ -1249,11 +1299,17 @@ async function extractAudioInfo(input) {
             );
 
             try {
-                await runSpoolDownload(
-                    target,
-                    mode,
-                    outputPath
-                );
+                const spoolExecution =
+                    await runSpoolDownload(
+                        target,
+                        mode,
+                        outputPath
+                    );
+
+                const spoolMetadata =
+                    parseSpoolMetadata(
+                        spoolExecution?.stdout
+                    );
 
                 const stat =
                     fs.statSync(
@@ -1282,6 +1338,14 @@ async function extractAudioInfo(input) {
                     `${sizeMb} MB -> ${outputPath}`
                 );
 
+                if (spoolMetadata.title) {
+                    console.log(
+                        `[YT SPOOL ${label}] metadata: ` +
+                        `${spoolMetadata.channel || spoolMetadata.uploader || 'YouTube'} - ` +
+                        `${spoolMetadata.title}`
+                    );
+                }
+
                 // Safety net: il file resta disponibile abbastanza a lungo
                 // per coda, seek e filtri. /tmp e' comunque effimero.
                 const cleanupTimer =
@@ -1308,6 +1372,7 @@ async function extractAudioInfo(input) {
 
                 const result = {
                     title:
+                        spoolMetadata.title ||
                         hints.title?.trim?.() ||
                         fallbackTitle,
 
@@ -1315,26 +1380,34 @@ async function extractAudioInfo(input) {
                         outputPath,
 
                     channel:
+                        spoolMetadata.channel ||
+                        spoolMetadata.uploader ||
                         hints.channel?.trim?.() ||
                         'YouTube',
 
                     sourceUrl:
-                        /^https?:\/\//i.test(
-                            String(target || '')
-                        )
-                            ? target
-                            : (
-                                hints.sourceUrl ||
-                                null
-                            ),
+                        spoolMetadata.webpageUrl ||
+                        (
+                            /^https?:\/\//i.test(
+                                String(target || '')
+                            )
+                                ? target
+                                : (
+                                    hints.sourceUrl ||
+                                    null
+                                )
+                        ),
 
                     duration:
-                        Number.isFinite(
-                            parsedDuration
-                        ) &&
-                        parsedDuration > 0
-                            ? parsedDuration
-                            : null,
+                        spoolMetadata.duration ||
+                        (
+                            Number.isFinite(
+                                parsedDuration
+                            ) &&
+                            parsedDuration > 0
+                                ? parsedDuration
+                                : null
+                        ),
 
                     artist:
                         hints.artist ||
