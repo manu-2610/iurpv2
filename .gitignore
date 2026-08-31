@@ -21,3 +21,6 @@ npm-debug.log*
 *.log
 .DS_Store
 Thumbs.db
+youtube-cookies.txt
+youtube-cookies-*.txt
+railway-live-backup/

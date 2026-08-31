@@ -38,6 +38,9 @@ const streamPlaybackContext = new Map();
 // Protezione anti-rate-limit YouTube.
 const youtubeTargetCooldowns = new Map();
 let youtubeGlobalCooldownUntil = 0;
+let youtubeCircuitFailures = [];
+let youtubeCircuitOpenUntil = 0;
+let youtubeCircuitBackoffMs = 120_000;
 const {
     MEDIA_ADMIN_COMMANDS,
     handleLibraryAdminAutocomplete,
@@ -54,37 +57,79 @@ async function extractAudioInfo(input) {
         ? 'Brano YouTube'
         : input.trim() || 'Brano YouTube';
 
+    // ZERO_COST_V3_CORE
+    function getYoutubeCookiesPath() {
+        const candidates = [
+            process.env.YTDLP_COOKIES_PATH?.trim(),
+            '/data/youtube-cookies.txt',
+            './youtube-cookies.txt',
+            './cookies.txt'
+        ]
+            .filter(Boolean);
+
+        for (const candidate of candidates) {
+            try {
+                if (fs.existsSync(candidate)) {
+                    return candidate;
+                }
+            } catch {
+                // Ignora path non leggibili e prova il successivo.
+            }
+        }
+
+        return null;
+    }
+
     function baseFlags(mode = 'normal') {
         const flags = {
             noWarnings: true,
             jsRuntimes: 'node',
             remoteComponents: 'ejs:github',
 
-            // Rendiamo yt-dlp tollerante ai problemi temporanei,
-            // senza moltiplicare i tentativi lato bot.
-            extractorRetries: 2,
-            retries: 2,
+            // I fallback V3 sono espliciti: evitiamo raffiche interne.
+            extractorRetries: 1,
+            retries: 1,
             fragmentRetries: 2,
             socketTimeout: 20
         };
 
-        if (fs.existsSync('./cookies.txt')) {
-            flags.cookies = './cookies.txt';
+        const authenticatedModes =
+            new Set([
+                'auth',
+                'authEmbedded',
+                'authPot'
+            ]);
+
+        const cookiesPath =
+            authenticatedModes.has(mode)
+                ? getYoutubeCookiesPath()
+                : null;
+
+        if (cookiesPath) {
+            flags.cookies = cookiesPath;
+
+            // Piccolo ritardo tra richieste dell'account dedicato.
+            flags.sleepRequests = 1;
         }
 
-        // SMART_YOUTUBE_FALLBACK_V2
-        // mweb + bgutil vengono usati SOLO nel fallback anti-bot/PO.
-        if (mode === 'pot') {
-            const potProviderUrl =
-                process.env.POT_PROVIDER_URL?.trim();
+        const potProviderUrl =
+            process.env.POT_PROVIDER_URL?.trim();
 
-            if (potProviderUrl) {
-                flags.pluginDirs = './yt-dlp-plugins';
-                flags.extractorArgs = [
-                    'youtube:player_client=mweb',
-                    `youtubepot-bgutilhttp:base_url=${potProviderUrl}`
-                ];
-            }
+        if (mode === 'authEmbedded') {
+            flags.extractorArgs = [
+                'youtube:player_client=web_embedded'
+            ];
+        }
+
+        if (
+            (mode === 'pot' || mode === 'authPot') &&
+            potProviderUrl
+        ) {
+            flags.pluginDirs = './yt-dlp-plugins';
+            flags.extractorArgs = [
+                'youtube:player_client=mweb',
+                `youtubepot-bgutilhttp:base_url=${potProviderUrl}`
+            ];
         }
 
         if (process.env.YTDLP_DEBUG === '1') {
@@ -275,7 +320,10 @@ async function extractAudioInfo(input) {
                 sourceUrl ||
                 hints.sourceUrl ||
                 null,
-            createdAt: Date.now()
+            createdAt: Date.now(),
+            extractionMode:
+                hints.extractionMode ||
+                'normal'
         };
 
         streamPlaybackContext.set(
@@ -343,6 +391,7 @@ async function extractAudioInfo(input) {
 
             forbidden:
                 text.includes('http error 403') ||
+                text.includes('403 forbidden') ||
                 text.includes('forbidden'),
 
             poToken:
@@ -372,6 +421,103 @@ async function extractAudioInfo(input) {
         return idMatch
             ? `video:${idMatch[1]}`
             : text.slice(0, 300);
+    }
+
+    function getYoutubeCircuitRemaining() {
+        const now =
+            Date.now();
+
+        if (youtubeCircuitOpenUntil <= now) {
+            return 0;
+        }
+
+        return Math.ceil(
+            (youtubeCircuitOpenUntil - now) / 1000
+        );
+    }
+
+    function registerYoutubeFailure(err) {
+        const kind =
+            classifyYtError(err);
+
+        if (
+            !kind.rateLimited &&
+            !kind.botCheck &&
+            !kind.forbidden
+        ) {
+            return;
+        }
+
+        const now =
+            Date.now();
+
+        youtubeCircuitFailures =
+            youtubeCircuitFailures
+                .filter(
+                    timestamp =>
+                        now - timestamp <= 60_000
+                );
+
+        youtubeCircuitFailures.push(now);
+
+        if (youtubeCircuitFailures.length < 3) {
+            return;
+        }
+
+        youtubeCircuitOpenUntil =
+            now +
+            youtubeCircuitBackoffMs;
+
+        console.warn(
+            `[YT CIRCUIT] OPEN per ${Math.ceil(youtubeCircuitBackoffMs / 1000)}s ` +
+            `dopo ${youtubeCircuitFailures.length} errori anti-bot/HTTP.`
+        );
+
+        youtubeCircuitFailures = [];
+
+        youtubeCircuitBackoffMs =
+            Math.min(
+                youtubeCircuitBackoffMs * 2,
+                10 * 60_000
+            );
+    }
+
+    function registerYoutubePlaybackSuccess() {
+        if (
+            youtubeCircuitFailures.length ||
+            youtubeCircuitOpenUntil
+        ) {
+            console.log(
+                '[YT CIRCUIT] Playback stabile: contatori anti-bot azzerati.'
+            );
+        }
+
+        youtubeCircuitFailures = [];
+        youtubeCircuitOpenUntil = 0;
+        youtubeCircuitBackoffMs = 120_000;
+    }
+
+    function assertYoutubeCircuitAvailable() {
+        const remaining =
+            getYoutubeCircuitRemaining();
+
+        if (remaining > 0) {
+            throw new Error(
+                `Protezione YouTube attiva dopo ripetuti 403/429/bot-check. ` +
+                `Riprova tra circa ${remaining}s.`
+            );
+        }
+
+        if (
+            youtubeCircuitOpenUntil &&
+            youtubeCircuitOpenUntil <= Date.now()
+        ) {
+            console.log(
+                '[YT CIRCUIT] HALF-OPEN: eseguo una richiesta di prova.'
+            );
+
+            youtubeCircuitOpenUntil = 0;
+        }
     }
 
     function getYoutubeCooldownRemaining(target) {
@@ -411,39 +557,114 @@ async function extractAudioInfo(input) {
             youtubeGlobalCooldownUntil =
                 Math.max(
                     youtubeGlobalCooldownUntil,
-                    now + 20_000
+                    now + 30_000
                 );
         }
 
         if (
             kind.rateLimited ||
-            kind.botCheck
+            kind.botCheck ||
+            kind.forbidden
         ) {
             youtubeTargetCooldowns.set(
                 getYoutubeCooldownKey(target),
-                now + 180_000
+                now + 90_000
             );
         }
     }
 
-    function shouldTryPotFallback(err) {
-        if (!process.env.POT_PROVIDER_URL?.trim()) {
-            return false;
+    function modeLabel(mode) {
+        return {
+            normal: 'NORMAL',
+            auth: 'AUTH',
+            authEmbedded: 'AUTH-EMBED',
+            pot: 'POT',
+            authPot: 'AUTH+POT'
+        }[mode] || String(mode).toUpperCase();
+    }
+
+    function modeIsAvailable(mode) {
+        const cookies =
+            getYoutubeCookiesPath();
+
+        const pot =
+            process.env.POT_PROVIDER_URL?.trim();
+
+        if (
+            mode === 'auth' ||
+            mode === 'authEmbedded'
+        ) {
+            return Boolean(cookies);
         }
 
+        if (mode === 'pot') {
+            return Boolean(pot);
+        }
+
+        if (mode === 'authPot') {
+            return Boolean(
+                cookies &&
+                pot
+            );
+        }
+
+        return true;
+    }
+
+    function buildFallbackModes(err) {
         const kind =
             classifyYtError(err);
 
         if (kind.unavailable) {
-            return false;
+            return [];
         }
 
-        return (
-            kind.botCheck ||
-            kind.rateLimited ||
+        // Un 429 puro indica rate-limit dell'IP: non lo peggioriamo.
+        if (
+            kind.rateLimited &&
+            !kind.botCheck
+        ) {
+            return [];
+        }
+
+        const modes = [];
+
+        if (kind.botCheck) {
+            if (modeIsAvailable('auth')) {
+                modes.push(
+                    'auth',
+                    'authEmbedded'
+                );
+            }
+
+            if (modeIsAvailable('authPot')) {
+                modes.push('authPot');
+            }
+
+            if (modeIsAvailable('pot')) {
+                modes.push('pot');
+            }
+
+        } else if (
             kind.forbidden ||
             kind.poToken
-        );
+        ) {
+            if (modeIsAvailable('pot')) {
+                modes.push('pot');
+            }
+
+            if (modeIsAvailable('authPot')) {
+                modes.push('authPot');
+            }
+
+            if (modeIsAvailable('authEmbedded')) {
+                modes.push('authEmbedded');
+            }
+        }
+
+        return [
+            ...new Set(modes)
+        ];
     }
 
     async function resolveTargetMode(
@@ -451,147 +672,61 @@ async function extractAudioInfo(input) {
         hints,
         mode
     ) {
-        let lastError = null;
-
         const label =
-            mode === 'pot'
-                ? 'POT'
-                : 'NORMAL';
+            modeLabel(mode);
 
-        for (const format of [
-            'bestaudio/best',
-            'best'
-        ]) {
-            try {
-                const flags = {
-                    ...baseFlags(mode),
-                    dumpSingleJson: true,
-                    format,
-                    noPlaylist: true
-                };
+        const flags = {
+            ...baseFlags(mode),
+            dumpSingleJson: true,
+            format: 'bestaudio/best',
+            noPlaylist: true
+        };
 
-                const output =
-                    await youtubeDl(
-                        target,
-                        flags
-                    );
+        try {
+            const output =
+                await youtubeDl(
+                    target,
+                    flags
+                );
 
-                const info =
-                    parseInfo(output);
+            const info =
+                parseInfo(output);
 
-                const result =
-                    normalizeResult(
-                        info,
-                        hints
-                    );
-
-                if (result) {
-                    if (
-                        !info?.title ||
-                        !(info?.channel || info?.uploader)
-                    ) {
-                        console.warn(
-                            `[YT ${label}] Flusso trovato con metadati parziali: ` +
-                            `${result.channel} - ${result.title}`
-                        );
+            const result =
+                normalizeResult(
+                    info,
+                    {
+                        ...hints,
+                        extractionMode:
+                            mode
                     }
-
-                    return result;
-                }
-
-            } catch (err) {
-                lastError = err;
-
-                console.warn(
-                    `[YT ${label}] JSON ${format} fallito: ` +
-                    getRelevantYtErrorLine(err)
                 );
 
-                const kind =
-                    classifyYtError(err);
-
-                if (
-                    kind.botCheck ||
-                    kind.rateLimited ||
-                    kind.unavailable
-                ) {
-                    throw err;
-                }
-            }
-        }
-
-        for (const format of [
-            'bestaudio/best',
-            'best'
-        ]) {
-            try {
-                const flags = {
-                    ...baseFlags(mode),
-                    getUrl: true,
-                    format,
-                    noPlaylist: true
-                };
-
-                const output =
-                    await youtubeDl(
-                        target,
-                        flags
-                    );
-
-                const lines =
-                    String(output || '')
-                        .split(/\r?\n/)
-                        .map(line => line.trim())
-                        .filter(Boolean);
-
-                const streamUrl =
-                    lines.find(line =>
-                        /^https?:\/\//i.test(line)
-                    );
-
-                if (streamUrl) {
-                    const result =
-                        normalizeResult(
-                            null,
-                            hints,
-                            streamUrl
-                        );
-
-                    console.warn(
-                        `[YT ${label}] Fallback senza metadati completi: ` +
-                        `${result.channel} - ${result.title}`
-                    );
-
-                    return result;
-                }
-
-            } catch (err) {
-                lastError = err;
-
-                console.warn(
-                    `[YT ${label}] get-url ${format} fallito: ` +
-                    getRelevantYtErrorLine(err)
+            if (!result) {
+                throw new Error(
+                    `yt-dlp ${label} non ha restituito un URL audio utilizzabile.`
                 );
-
-                const kind =
-                    classifyYtError(err);
-
-                if (
-                    kind.botCheck ||
-                    kind.rateLimited ||
-                    kind.unavailable
-                ) {
-                    throw err;
-                }
             }
-        }
 
-        throw (
-            lastError ||
-            new Error(
-                'Nessun flusso riproducibile trovato.'
-            )
-        );
+            console.log(
+                `[YT ${label}] flusso ottenuto` +
+                (
+                    flags.cookies
+                        ? ' con sessione autenticata'
+                        : ''
+                )
+            );
+
+            return result;
+
+        } catch (err) {
+            console.warn(
+                `[YT ${label}] fallito: ` +
+                getRelevantYtErrorLine(err)
+            );
+
+            throw err;
+        }
     }
 
     async function resolveTarget(
@@ -599,6 +734,8 @@ async function extractAudioInfo(input) {
         hints = {},
         attempts = 1
     ) {
+        assertYoutubeCircuitAvailable();
+
         const cooldown =
             getYoutubeCooldownRemaining(
                 target
@@ -611,101 +748,74 @@ async function extractAudioInfo(input) {
             );
         }
 
-        let normalError = null;
+        let lastError = null;
 
-        const normalAttempts =
-            Math.max(
-                1,
-                Math.min(
-                    Number(attempts) || 1,
-                    2
-                )
+        try {
+            return await resolveTargetMode(
+                target,
+                hints,
+                'normal'
             );
 
-        for (
-            let attempt = 1;
-            attempt <= normalAttempts;
-            attempt++
-        ) {
+        } catch (err) {
+            lastError = err;
+        }
+
+        const initialKind =
+            classifyYtError(
+                lastError
+            );
+
+        if (initialKind.unavailable) {
+            throw lastError;
+        }
+
+        const fallbackModes =
+            buildFallbackModes(
+                lastError
+            );
+
+        for (const mode of fallbackModes) {
             try {
+                console.warn(
+                    `[YT] Fallback ${modeLabel(mode)} attivato: ` +
+                    getRelevantYtErrorLine(lastError)
+                );
+
                 return await resolveTargetMode(
                     target,
                     hints,
-                    'normal'
+                    mode
                 );
 
             } catch (err) {
-                normalError = err;
+                lastError = err;
 
                 const kind =
                     classifyYtError(err);
 
                 if (
                     kind.unavailable ||
-                    shouldTryPotFallback(err) ||
-                    kind.botCheck ||
-                    kind.rateLimited
+                    (
+                        kind.rateLimited &&
+                        !kind.botCheck
+                    )
                 ) {
                     break;
                 }
-
-                if (attempt < normalAttempts) {
-                    await new Promise(
-                        resolve =>
-                            setTimeout(
-                                resolve,
-                                650
-                            )
-                    );
-                }
             }
         }
 
-        if (
-            normalError &&
-            shouldTryPotFallback(
-                normalError
-            )
-        ) {
-            console.warn(
-                `[YT] Fallback PO Token attivato: ` +
-                getRelevantYtErrorLine(normalError)
-            );
-
-            try {
-                return await resolveTargetMode(
-                    target,
-                    hints,
-                    'pot'
-                );
-
-            } catch (potError) {
-                applyYoutubeCooldown(
-                    target,
-                    potError
-                );
-
-                console.warn(
-                    `[YT POT] fallback fallito: ` +
-                    getRelevantYtErrorLine(potError)
-                );
-
-                throw potError;
-            }
-        }
-
-        if (normalError) {
-            applyYoutubeCooldown(
-                target,
-                normalError
-            );
-
-            throw normalError;
-        }
-
-        throw new Error(
-            'Nessun flusso riproducibile trovato.'
+        applyYoutubeCooldown(
+            target,
+            lastError
         );
+
+        registerYoutubeFailure(
+            lastError
+        );
+
+        throw lastError;
     }
 
     // ==========================================================
@@ -1443,6 +1553,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     function attachPlayerListeners(player, guildId) {
         player.on(AudioPlayerStatus.Idle, () => {
+            const currentState =
+                players.get(guildId);
+
+            if (currentState?.isHttpRetrying) {
+                console.log(
+                    `[AUDIO ${guildId}] Idle ignorato: recovery HTTP in corso.`
+                );
+                return;
+            }
+
             handleNext(guildId).catch(err => {
                 console.error(`❌ Errore gestione Idle [${guildId}]:`, err);
             });
@@ -1530,7 +1650,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         try {
-            const { title: actualTitle, url: finalUrl, channel: youtubeChannel } = await extractAudioInfo(query);
+            const {
+                title: actualTitle,
+                url: finalUrl,
+                channel: youtubeChannel,
+                sourceUrl
+            } = await extractAudioInfo(query);
 
             if (!state) {
                 const player = createAudioPlayer();
@@ -1546,7 +1671,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
                 state = {
                     player, connection, queue: [],
-                    current: { url: finalUrl, title: actualTitle, channel: youtubeChannel, user: interaction.user },
+                    current: { url: finalUrl, sourceUrl, title: actualTitle, channel: youtubeChannel, user: interaction.user },
                     loop: false, process: null, textChannel: interaction.channel, currentSeek: 0,
                     filters: { bassboost: false, nightcore: false, vaporwave: false, roulette: false },
                     isHandlingJumpscare: false,
@@ -1562,14 +1687,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 state.panelMessage = await interaction.editReply(createMusicPanel(actualTitle, interaction.user, false, state.filters, getPanelStatus(state), state));
             } else if (!state.current) {
                 await connectStateToVoiceChannel(state, voiceChannel, interaction.guild);
-                state.current = { url: finalUrl, title: actualTitle, channel: youtubeChannel, user: interaction.user };
+                state.current = { url: finalUrl, sourceUrl, title: actualTitle, channel: youtubeChannel, user: interaction.user };
                 state.textChannel = interaction.channel;
                 state.filters = { bassboost: false, nightcore: false, vaporwave: false, roulette: false };
 
                 await playResource(guildId, finalUrl, actualTitle, 0);
                 state.panelMessage = await interaction.editReply(createMusicPanel(actualTitle, interaction.user, state.loop, state.filters, getPanelStatus(state), state));
             } else {
-                state.queue.push({ url: finalUrl, title: actualTitle, channel: youtubeChannel, user: interaction.user });
+                state.queue.push({ url: finalUrl, sourceUrl, title: actualTitle, channel: youtubeChannel, user: interaction.user });
                 await interaction.editReply(`✅ In coda: **${actualTitle}**`);
             }
         } catch (e) {
@@ -1578,7 +1703,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
     }
 
-    async function playResource(guildId, url, title, seek = 0, isJumpscareActive = false) {
+    async function playResource(guildId, url, title, seek = 0, isJumpscareActive = false, httpRetry = 0) {
         const s = players.get(guildId);
         if (!s) return;
 
@@ -1738,6 +1863,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const ffmpegProcess = spawn(ffmpegPath, ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
         let ffmpegError = '';
+        let http403Detected = false;
+
+        const recoverySourceUrl =
+            s.current?.sourceUrl ||
+            playbackContext.sourceUrl ||
+            null;
+
+        const playbackSuccessTimer =
+            setTimeout(
+                () => {
+                    if (
+                        s.process === ffmpegProcess &&
+                        !ffmpegProcess.killed
+                    ) {
+                        registerYoutubePlaybackSuccess();
+                    }
+                },
+                7000
+            );
 
         ffmpegProcess.stderr.on('data', chunk => {
             const text =
@@ -1746,13 +1890,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ffmpegError =
                 (ffmpegError + text)
                     .slice(-6000);
+
+            if (
+                httpRetry < 1 &&
+                recoverySourceUrl &&
+                /(?:HTTP error 403|403 Forbidden|Server returned 403)/i.test(text)
+            ) {
+                http403Detected = true;
+
+                // Evita che l'Idle del vecchio URL faccia avanzare la coda
+                // mentre stiamo ottenendo un URL GoogleVideo fresco.
+                s.isHttpRetrying = true;
+            }
         });
 
         ffmpegProcess.on('error', err => {
             console.error('❌ Impossibile avviare FFmpeg:', err);
         });
 
-        ffmpegProcess.on('close', (code, signal) => {
+        ffmpegProcess.on('close', async (code, signal) => {
+            clearTimeout(
+                playbackSuccessTimer
+            );
+
             if (s.process === ffmpegProcess) {
                 s.process = null;
             }
@@ -1776,6 +1936,113 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 );
             }
 
+            const isHttp403 =
+                http403Detected ||
+                /(?:HTTP error 403|403 Forbidden|Server returned 403)/i.test(
+                    stderrText
+                );
+
+            if (
+                isHttp403 &&
+                !ffmpegProcess.killed &&
+                httpRetry < 1 &&
+                recoverySourceUrl
+            ) {
+                console.warn(
+                    `[YT RECOVERY ${guildId}] GoogleVideo 403: ` +
+                    `riestraggo la sorgente UNA volta.`
+                );
+
+                try {
+                    streamPlaybackContext.delete(
+                        url
+                    );
+
+                    const refreshed =
+                        await extractAudioInfo(
+                            recoverySourceUrl
+                        );
+
+                    if (!s.current) {
+                        s.isHttpRetrying = false;
+                        return;
+                    }
+
+                    s.current.url =
+                        refreshed.url;
+
+                    s.current.sourceUrl =
+                        refreshed.sourceUrl ||
+                        recoverySourceUrl;
+
+                    if (refreshed.channel) {
+                        s.current.channel =
+                            refreshed.channel;
+                    }
+
+                    if (refreshed.title) {
+                        s.current.title =
+                            refreshed.title;
+                    }
+
+                    await playResource(
+                        guildId,
+                        refreshed.url,
+                        s.current.title || title,
+                        seek,
+                        isJumpscareActive,
+                        httpRetry + 1
+                    );
+
+                    s.isHttpRetrying = false;
+
+                    console.log(
+                        `[YT RECOVERY ${guildId}] nuovo flusso avviato.`
+                    );
+
+                    return;
+
+                } catch (recoveryError) {
+                    s.isHttpRetrying = false;
+
+                    registerYoutubeFailure(
+                        recoveryError
+                    );
+
+                    console.error(
+                        `[YT RECOVERY ${guildId}] riestrazione fallita:`,
+                        recoveryError?.message ||
+                        recoveryError
+                    );
+
+                    setImmediate(() => {
+                        handleNext(guildId)
+                            .catch(err => {
+                                console.error(
+                                    `❌ Errore post-recovery [${guildId}]:`,
+                                    err
+                                );
+                            });
+                    });
+
+                    return;
+                }
+            }
+
+            if (
+                isHttp403 &&
+                !ffmpegProcess.killed
+            ) {
+                s.isHttpRetrying = false;
+
+                registerYoutubeFailure(
+                    new Error(
+                        stderrText ||
+                        'HTTP 403 GoogleVideo'
+                    )
+                );
+            }
+
             if (
                 code &&
                 !ffmpegProcess.killed
@@ -1796,6 +2063,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
             // processo: evita falsi eventi Idle durante seek/cambio filtro.
             s.player.play(resource);
             s.process = ffmpegProcess;
+
+            if (httpRetry > 0) {
+                s.isHttpRetrying = false;
+            }
 
             if (oldProcess && oldProcess !== ffmpegProcess && !oldProcess.killed) {
                 oldProcess.kill();
