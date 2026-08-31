@@ -874,6 +874,521 @@ async function extractAudioInfo(input) {
         }
     }
 
+    // ZERO_COST_V3_3_SPOOL_FALLBACK
+    function getSpoolBinaryPath() {
+        const candidates =
+            process.platform === 'win32'
+                ? [
+                    './node_modules/youtube-dl-exec/bin/yt-dlp.exe',
+                    './node_modules/youtube-dl-exec/bin/yt-dlp'
+                ]
+                : [
+                    './node_modules/youtube-dl-exec/bin/yt-dlp',
+                    './node_modules/youtube-dl-exec/bin/yt-dlp.exe'
+                ];
+
+        const found =
+            candidates.find(candidate => {
+                try {
+                    return fs.existsSync(candidate);
+                } catch {
+                    return false;
+                }
+            });
+
+        if (!found) {
+            throw new Error(
+                'Binary yt-dlp non trovato per la modalita spool.'
+            );
+        }
+
+        return found;
+    }
+
+    function makeSpoolPath() {
+        const pathModule =
+            require('path');
+
+        const osModule =
+            require('os');
+
+        const spoolDir =
+            process.env.IURP_SPOOL_DIR?.trim() ||
+            osModule.tmpdir();
+
+        const unique =
+            `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+        return pathModule.join(
+            spoolDir,
+            `iurpv2-spool-${unique}.media`
+        );
+    }
+
+    function removeSpoolFile(filePath) {
+        if (!filePath) return;
+
+        try {
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+
+                console.log(
+                    `[YT SPOOL] file temporaneo rimosso: ${filePath}`
+                );
+            }
+        } catch (err) {
+            console.warn(
+                `[YT SPOOL] impossibile rimuovere ${filePath}: ` +
+                `${err?.message || err}`
+            );
+        }
+    }
+
+    function sweepOldSpoolFiles() {
+        try {
+            const pathModule =
+                require('path');
+
+            const osModule =
+                require('os');
+
+            const spoolDir =
+                process.env.IURP_SPOOL_DIR?.trim() ||
+                osModule.tmpdir();
+
+            const maxAgeMs =
+                24 * 60 * 60 * 1000;
+
+            const now =
+                Date.now();
+
+            for (const name of fs.readdirSync(spoolDir)) {
+                if (!name.startsWith('iurpv2-spool-')) {
+                    continue;
+                }
+
+                const fullPath =
+                    pathModule.join(
+                        spoolDir,
+                        name
+                    );
+
+                try {
+                    const stat =
+                        fs.statSync(fullPath);
+
+                    if (
+                        stat.isFile() &&
+                        now - stat.mtimeMs > maxAgeMs
+                    ) {
+                        fs.unlinkSync(fullPath);
+                    }
+                } catch {
+                    // Un altro processo/routine puo' averlo gia rimosso.
+                }
+            }
+        } catch {
+            // Pulizia best-effort: non deve mai bloccare la riproduzione.
+        }
+    }
+
+    function getSpoolErrorLine(stderr, stdout) {
+        const lines =
+            `${stderr || ''}\n${stdout || ''}`
+                .split(/\r?\n/)
+                .map(line => line.trim())
+                .filter(Boolean);
+
+        return (
+            lines.find(line => /^ERROR:/i.test(line)) ||
+            lines.find(line =>
+                /403|429|sign in to confirm|too many requests|unavailable/i.test(line)
+            ) ||
+            lines[lines.length - 1] ||
+            'errore yt-dlp spool sconosciuto'
+        );
+    }
+
+    function runSpoolDownload(
+        target,
+        mode,
+        outputPath
+    ) {
+        return new Promise(
+            (resolve, reject) => {
+                const binary =
+                    getSpoolBinaryPath();
+
+                const cookiesPath =
+                    getYoutubeCookiesPath();
+
+                const potProviderUrl =
+                    process.env.POT_PROVIDER_URL?.trim();
+
+                const args = [
+                    '--no-warnings',
+                    '--js-runtimes',
+                    'node',
+                    '--remote-components',
+                    'ejs:github',
+                    '--extractor-retries',
+                    '1',
+                    '--retries',
+                    '2',
+                    '--fragment-retries',
+                    '2',
+                    '--socket-timeout',
+                    '20',
+                    '--no-playlist',
+                    '--no-part',
+                    '--format',
+                    'bestaudio/best',
+                    '--output',
+                    outputPath
+                ];
+
+                if (
+                    mode === 'spoolAuth' ||
+                    mode === 'spoolAuthPot'
+                ) {
+                    if (!cookiesPath) {
+                        reject(
+                            new Error(
+                                'Cookie YouTube non disponibili per lo spool autenticato.'
+                            )
+                        );
+                        return;
+                    }
+
+                    args.push(
+                        '--cookies',
+                        cookiesPath,
+                        '--sleep-requests',
+                        '1'
+                    );
+                }
+
+                if (mode === 'spoolAuth') {
+                    args.push(
+                        '--extractor-args',
+                        'youtube:player_client=default,web_embedded'
+                    );
+                }
+
+                if (mode === 'spoolAuthPot') {
+                    if (!potProviderUrl) {
+                        reject(
+                            new Error(
+                                'POT_PROVIDER_URL mancante per lo spool AUTH+POT.'
+                            )
+                        );
+                        return;
+                    }
+
+                    args.push(
+                        '--plugin-dirs',
+                        './yt-dlp-plugins',
+                        '--extractor-args',
+                        'youtube:player_client=mweb',
+                        '--extractor-args',
+                        `youtubepot-bgutilhttp:base_url=${potProviderUrl}`
+                    );
+                }
+
+                args.push(
+                    target
+                );
+
+                const child =
+                    spawn(
+                        binary,
+                        args,
+                        {
+                            cwd:
+                                process.cwd(),
+
+                            env:
+                                process.env,
+
+                            windowsHide:
+                                true,
+
+                            stdio: [
+                                'ignore',
+                                'pipe',
+                                'pipe'
+                            ]
+                        }
+                    );
+
+                let stdout = '';
+                let stderr = '';
+
+                child.stdout.on(
+                    'data',
+                    chunk => {
+                        stdout =
+                            (stdout + chunk.toString())
+                                .slice(-12000);
+                    }
+                );
+
+                child.stderr.on(
+                    'data',
+                    chunk => {
+                        stderr =
+                            (stderr + chunk.toString())
+                                .slice(-16000);
+                    }
+                );
+
+                child.once(
+                    'error',
+                    err => {
+                        reject(err);
+                    }
+                );
+
+                child.once(
+                    'close',
+                    code => {
+                        if (code === 0) {
+                            resolve({
+                                stdout,
+                                stderr
+                            });
+
+                            return;
+                        }
+
+                        const error =
+                            new Error(
+                                getSpoolErrorLine(
+                                    stderr,
+                                    stdout
+                                )
+                            );
+
+                        error.code =
+                            code;
+
+                        error.stdout =
+                            stdout;
+
+                        error.stderr =
+                            stderr;
+
+                        reject(error);
+                    }
+                );
+            }
+        );
+    }
+
+    async function resolveSpoolFallback(
+        target,
+        hints = {},
+        cause = null
+    ) {
+        const kind =
+            classifyYtError(
+                cause
+            );
+
+        if (kind.unavailable) {
+            throw cause;
+        }
+
+        if (
+            kind.rateLimited &&
+            !kind.botCheck
+        ) {
+            throw cause;
+        }
+
+        const modes = [];
+
+        if (modeIsAvailable('auth')) {
+            modes.push(
+                'spoolAuth'
+            );
+        }
+
+        if (modeIsAvailable('authPot')) {
+            modes.push(
+                'spoolAuthPot'
+            );
+        }
+
+        if (!modes.length) {
+            throw (
+                cause ||
+                new Error(
+                    'Nessuna modalita spool disponibile.'
+                )
+            );
+        }
+
+        sweepOldSpoolFiles();
+
+        let lastError =
+            cause;
+
+        for (const mode of modes) {
+            const label =
+                mode === 'spoolAuth'
+                    ? 'AUTH'
+                    : 'AUTH+POT';
+
+            const outputPath =
+                makeSpoolPath();
+
+            console.warn(
+                `[YT SPOOL ${label}] fallback locale attivato. ` +
+                `yt-dlp scarichera' direttamente il media.`
+            );
+
+            try {
+                await runSpoolDownload(
+                    target,
+                    mode,
+                    outputPath
+                );
+
+                const stat =
+                    fs.statSync(
+                        outputPath
+                    );
+
+                if (
+                    !stat.isFile() ||
+                    stat.size < 1024
+                ) {
+                    throw new Error(
+                        'File spool creato ma vuoto/incompleto.'
+                    );
+                }
+
+                const sizeMb =
+                    (
+                        stat.size /
+                        1024 /
+                        1024
+                    )
+                        .toFixed(2);
+
+                console.log(
+                    `[YT SPOOL ${label}] pronto: ` +
+                    `${sizeMb} MB -> ${outputPath}`
+                );
+
+                // Safety net: il file resta disponibile abbastanza a lungo
+                // per coda, seek e filtri. /tmp e' comunque effimero.
+                const cleanupTimer =
+                    setTimeout(
+                        () => {
+                            removeSpoolFile(
+                                outputPath
+                            );
+                        },
+                        24 * 60 * 60 * 1000
+                    );
+
+                if (
+                    typeof cleanupTimer.unref ===
+                    'function'
+                ) {
+                    cleanupTimer.unref();
+                }
+
+                const parsedDuration =
+                    Number(
+                        hints.duration
+                    );
+
+                const result = {
+                    title:
+                        hints.title?.trim?.() ||
+                        fallbackTitle,
+
+                    url:
+                        outputPath,
+
+                    channel:
+                        hints.channel?.trim?.() ||
+                        'YouTube',
+
+                    sourceUrl:
+                        /^https?:\/\//i.test(
+                            String(target || '')
+                        )
+                            ? target
+                            : (
+                                hints.sourceUrl ||
+                                null
+                            ),
+
+                    duration:
+                        Number.isFinite(
+                            parsedDuration
+                        ) &&
+                        parsedDuration > 0
+                            ? parsedDuration
+                            : null,
+
+                    artist:
+                        hints.artist ||
+                        null,
+
+                    track:
+                        hints.track ||
+                        null,
+
+                    album:
+                        hints.album ||
+                        null,
+
+                    categories:
+                        hints.categories ||
+                        null,
+
+                    extractionMode:
+                        mode,
+
+                    isSpool:
+                        true
+                };
+
+                dynamicText.rememberMetadata(
+                    result
+                );
+
+                return result;
+
+            } catch (err) {
+                lastError =
+                    err;
+
+                removeSpoolFile(
+                    outputPath
+                );
+
+                console.warn(
+                    `[YT SPOOL ${label}] fallito: ` +
+                    `${getSpoolErrorLine(err?.stderr, err?.stdout || err?.message)}`
+                );
+            }
+        }
+
+        throw (
+            lastError ||
+            cause ||
+            new Error(
+                'Tutti i fallback spool sono falliti.'
+            )
+        );
+    }
+
     async function resolveTarget(
         target,
         hints = {},
@@ -949,6 +1464,19 @@ async function extractAudioInfo(input) {
                     break;
                 }
             }
+        }
+
+        try {
+            return await resolveSpoolFallback(
+                target,
+                hints,
+                lastError
+            );
+
+        } catch (spoolError) {
+            lastError =
+                spoolError ||
+                lastError;
         }
 
         applyYoutubeCooldown(
@@ -1979,9 +2507,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         ffmpegArgs.push(
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '5',
+            ...(
+                /^https?:\/\//i.test(
+                    String(url || '')
+                )
+                    ? [
+                        '-reconnect', '1',
+                        '-reconnect_streamed', '1',
+                        '-reconnect_delay_max', '5'
+                    ]
+                    : []
+            ),
             '-ss', s.currentSeek.toString(),
             '-i', url
         );
