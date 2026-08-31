@@ -194,7 +194,19 @@ async function extractAudioInfo(input) {
 
         if (mode === 'authEmbedded') {
             flags.extractorArgs = [
-                'youtube:player_client=web_embedded'
+                'youtube:player_client=default,web_embedded'
+            ];
+        }
+
+        if (mode === 'webSafari') {
+            flags.extractorArgs = [
+                'youtube:player_client=web_safari'
+            ];
+        }
+
+        if (mode === 'androidVr') {
+            flags.extractorArgs = [
+                'youtube:player_client=android_vr;player_skip=webpage,configs'
             ];
         }
 
@@ -656,7 +668,9 @@ async function extractAudioInfo(input) {
             auth: 'AUTH',
             authEmbedded: 'AUTH-EMBED',
             pot: 'POT',
-            authPot: 'AUTH+POT'
+            authPot: 'AUTH+POT',
+            webSafari: 'WEB-SAFARI',
+            androidVr: 'ANDROID-VR'
         }[mode] || String(mode).toUpperCase();
     }
 
@@ -689,59 +703,104 @@ async function extractAudioInfo(input) {
     }
 
     function buildFallbackModes(err) {
-        const kind =
-            classifyYtError(err);
+        const kind = classifyYtError(err);
 
-        if (kind.unavailable) {
-            return [];
-        }
+        if (kind.unavailable) return [];
 
-        // Un 429 puro indica rate-limit dell'IP: non lo peggioriamo.
-        if (
-            kind.rateLimited &&
-            !kind.botCheck
-        ) {
+        if (kind.rateLimited && !kind.botCheck) {
             return [];
         }
 
         const modes = [];
 
-        if (kind.botCheck) {
-            if (modeIsAvailable('auth')) {
-                modes.push(
-                    'auth',
-                    'authEmbedded'
-                );
-            }
-
-            if (modeIsAvailable('authPot')) {
-                modes.push('authPot');
-            }
-
-            if (modeIsAvailable('pot')) {
-                modes.push('pot');
-            }
-
-        } else if (
-            kind.forbidden ||
-            kind.poToken
+        if (
+            (kind.botCheck || kind.forbidden || kind.poToken) &&
+            modeIsAvailable('auth')
         ) {
-            if (modeIsAvailable('pot')) {
-                modes.push('pot');
-            }
-
-            if (modeIsAvailable('authPot')) {
-                modes.push('authPot');
-            }
-
-            if (modeIsAvailable('authEmbedded')) {
-                modes.push('authEmbedded');
-            }
+            modes.push('auth', 'authEmbedded');
         }
 
-        return [
-            ...new Set(modes)
-        ];
+        if (kind.botCheck || kind.forbidden || kind.poToken) {
+            if (modeIsAvailable('authPot')) modes.push('authPot');
+            if (modeIsAvailable('pot')) modes.push('pot');
+
+            // Emergency fallbacks: ultimi, per non aumentare richieste inutili.
+            modes.push('webSafari', 'androidVr');
+        }
+
+        return [...new Set(modes)];
+    }
+
+    // ZERO_COST_V3_2_VERIFIED_STREAM
+    async function preflightGoogleVideo(url, info, mode) {
+        if (process.env.YTDLP_PREFLIGHT === '0' || !/^https?:\/\//i.test(String(url || ''))) return;
+
+        let hostname = '';
+        try {
+            hostname = new URL(url).hostname.toLowerCase();
+        } catch {
+            return;
+        }
+
+        if (!hostname.endsWith('.googlevideo.com')) return;
+
+        const sourceHeaders =
+            info?.http_headers && typeof info.http_headers === 'object'
+                ? info.http_headers
+                : {};
+
+        const requestHeaders = {};
+
+        for (const name of ['User-Agent', 'Accept', 'Accept-Language', 'Referer', 'Origin']) {
+            const value = sourceHeaders[name] ?? sourceHeaders[name.toLowerCase()];
+            if (value) requestHeaders[name] = String(value);
+        }
+
+        requestHeaders.Range = 'bytes=0-32767';
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 8000);
+
+        try {
+            const response = await fetch(url, {
+                method: 'GET',
+                headers: requestHeaders,
+                redirect: 'follow',
+                signal: controller.signal
+            });
+
+            const status = Number(response.status);
+
+            try {
+                await response.body?.cancel();
+            } catch {}
+
+            if (status === 200 || status === 206) {
+                console.log(`[YT PREFLIGHT ${modeLabel(mode)}] GoogleVideo HTTP ${status} OK`);
+                return;
+            }
+
+            const error = new Error(
+                `HTTP Error ${status}: GoogleVideo preflight rifiutato in modalita' ${modeLabel(mode)}`
+            );
+            error.preflightStatus = status;
+            error.preflightMode = mode;
+            throw error;
+
+        } catch (err) {
+            if (err?.preflightStatus) {
+                console.warn(
+                    `[YT PREFLIGHT ${modeLabel(mode)}] HTTP ${err.preflightStatus}: scarto URL prima di FFmpeg.`
+                );
+                throw err;
+            }
+
+            console.warn(
+                `[YT PREFLIGHT ${modeLabel(mode)}] inconcludente (${err?.name || 'errore'}): provo comunque FFmpeg.`
+            );
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     async function resolveTargetMode(
@@ -755,7 +814,10 @@ async function extractAudioInfo(input) {
         const flags = {
             ...baseFlags(mode),
             dumpSingleJson: true,
-            format: 'bestaudio/best',
+            format:
+                mode === 'webSafari'
+                    ? 'bestaudio[protocol*=m3u8]/bestaudio/best'
+                    : 'bestaudio/best',
             noPlaylist: true
         };
 
@@ -785,8 +847,14 @@ async function extractAudioInfo(input) {
                 );
             }
 
+            await preflightGoogleVideo(
+                result.url,
+                info,
+                mode
+            );
+
             console.log(
-                `[YT ${label}] flusso ottenuto` +
+                `[YT ${label}] flusso verificato` +
                 (
                     flags.cookies
                         ? ' con sessione autenticata'
