@@ -50,6 +50,83 @@ const {
 
 // yt-dlp: usa il wrapper ufficiale invece di un percorso .exe hardcoded.
 // Questo rende il bot portabile e permette di gestire gli aggiornamenti di YouTube.
+
+// ZERO_COST_V3_1_PLAYER_HEALTH
+function registerYoutubePlayerFailure(err) {
+    const text =
+        String(
+            err?.stderr ||
+            err?.stdout ||
+            err?.message ||
+            err ||
+            ''
+        )
+            .toLowerCase();
+
+    const relevant =
+        text.includes('http error 429') ||
+        text.includes('too many requests') ||
+        text.includes('rate limit') ||
+        text.includes('http error 403') ||
+        text.includes('403 forbidden') ||
+        text.includes('server returned 403') ||
+        text.includes("sign in to confirm you're not a bot") ||
+        text.includes('sign in to confirm you’re not a bot') ||
+        text.includes('login_required');
+
+    if (!relevant) {
+        return;
+    }
+
+    const now =
+        Date.now();
+
+    youtubeCircuitFailures =
+        youtubeCircuitFailures.filter(
+            timestamp =>
+                now - timestamp <= 60_000
+        );
+
+    youtubeCircuitFailures.push(now);
+
+    if (youtubeCircuitFailures.length < 3) {
+        return;
+    }
+
+    youtubeCircuitOpenUntil =
+        now +
+        youtubeCircuitBackoffMs;
+
+    console.warn(
+        `[YT CIRCUIT] OPEN per ${Math.ceil(youtubeCircuitBackoffMs / 1000)}s ` +
+        `dopo ${youtubeCircuitFailures.length} errori anti-bot/HTTP.`
+    );
+
+    youtubeCircuitFailures = [];
+
+    youtubeCircuitBackoffMs =
+        Math.min(
+            youtubeCircuitBackoffMs * 2,
+            10 * 60_000
+        );
+}
+
+
+function registerYoutubePlayerSuccess() {
+    if (
+        youtubeCircuitFailures.length ||
+        youtubeCircuitOpenUntil
+    ) {
+        console.log(
+            '[YT CIRCUIT] Playback stabile: contatori anti-bot azzerati.'
+        );
+    }
+
+    youtubeCircuitFailures = [];
+    youtubeCircuitOpenUntil = 0;
+    youtubeCircuitBackoffMs = 120_000;
+}
+
 async function extractAudioInfo(input) {
     const isDirectUrl = /^https?:\/\//i.test(input);
 
@@ -1877,7 +1954,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                         s.process === ffmpegProcess &&
                         !ffmpegProcess.killed
                     ) {
-                        registerYoutubePlaybackSuccess();
+                        registerYoutubePlayerSuccess();
                     }
                 },
                 7000
@@ -2005,7 +2082,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 } catch (recoveryError) {
                     s.isHttpRetrying = false;
 
-                    registerYoutubeFailure(
+                    registerYoutubePlayerFailure(
                         recoveryError
                     );
 
@@ -2035,7 +2112,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ) {
                 s.isHttpRetrying = false;
 
-                registerYoutubeFailure(
+                registerYoutubePlayerFailure(
                     new Error(
                         stderrText ||
                         'HTTP 403 GoogleVideo'
