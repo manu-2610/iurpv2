@@ -2542,6 +2542,37 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         ffmpegArgs.push('-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1');
 
+
+        // ZERO_COST_V3_3_1_LOCAL_FILE_FFMPEG
+        // Le opzioni HTTP di FFmpeg (-headers, reconnect, user_agent, ecc.)
+        // non devono essere applicate quando V3.3 passa un file spool locale.
+        if (!/^https?:\/\//i.test(String(url || ''))) {
+            const httpOnlyOptions = new Set([
+                '-headers',
+                '-user_agent',
+                '-referer',
+                '-cookies',
+                '-reconnect',
+                '-reconnect_streamed',
+                '-reconnect_delay_max',
+                '-reconnect_on_network_error',
+                '-reconnect_on_http_error'
+            ]);
+
+            for (let i = ffmpegArgs.length - 1; i >= 0; i--) {
+                if (!httpOnlyOptions.has(ffmpegArgs[i])) {
+                    continue;
+                }
+
+                // Tutte le opzioni sopra sono coppie opzione/valore.
+                ffmpegArgs.splice(i, 2);
+            }
+
+            console.log(
+                `[FFMPEG ${guildId}] input locale spool: ${url}`
+            );
+        }
+
         const ffmpegProcess = spawn(ffmpegPath, ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
         let ffmpegError = '';
         let http403Detected = false;
