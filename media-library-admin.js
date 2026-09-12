@@ -214,9 +214,27 @@ function timestampFromUrl(rawUrl) {
 
 async function inspectUrl(rawUrl) {
     const url = String(rawUrl || '').trim();
-    if (!/^https?:\/\//i.test(url)) throw new Error('Inserisci un URL valido.');
 
-    const flags = {
+    if (!/^https?:\/\//i.test(url)) {
+        throw new Error('Inserisci un URL valido.');
+    }
+
+    const cookieCandidates = [
+        process.env.YOUTUBE_COOKIES_PATH,
+        '/data/youtube-cookies.txt',
+        path.join(__dirname, 'youtube-cookies.txt'),
+        path.join(__dirname, 'cookies.txt')
+    ].filter(Boolean);
+
+    const cookies = cookieCandidates.find(candidate => {
+        try {
+            return fs.existsSync(candidate);
+        } catch {
+            return false;
+        }
+    });
+
+    const baseFlags = {
         dumpSingleJson: true,
         skipDownload: true,
         noWarnings: true,
@@ -226,24 +244,93 @@ async function inspectUrl(rawUrl) {
         socketTimeout: 20
     };
 
-    const cookies = path.join(__dirname, 'cookies.txt');
-    if (fs.existsSync(cookies)) flags.cookies = cookies;
+    const attempts = [
+        {
+            name: 'NORMAL',
+            flags: {
+                ...baseFlags,
+                extractorArgs: 'youtube:player_client=default,web_embedded'
+            }
+        },
+        {
+            name: 'AUTH',
+            flags: {
+                ...baseFlags,
+                ...(cookies ? { cookies } : {}),
+                extractorArgs: 'youtube:player_client=default,web_embedded'
+            }
+        },
+        {
+            name: 'AUTH-WEB',
+            flags: {
+                ...baseFlags,
+                ...(cookies ? { cookies } : {}),
+                extractorArgs: 'youtube:player_client=web'
+            }
+        }
+    ];
 
-    let output = await youtubeDl(url, flags);
-    if (typeof output === 'string') output = JSON.parse(output.trim());
-    if (Array.isArray(output?.entries)) output = output.entries.find(Boolean);
-    if (!output || typeof output !== 'object') throw new Error('yt-dlp non ha restituito metadati utilizzabili.');
+    let lastError = null;
 
-    const title = String(output.title || '').trim();
-    const canonicalUrl = String(output.webpage_url || output.original_url || url).trim();
-    if (!title) throw new Error('Non riesco a recuperare il titolo del video.');
+    for (const attempt of attempts) {
+        try {
+            console.log(
+                `[LIBRARY ADMIN] inspectUrl ${attempt.name}` +
+                `${cookies ? ` — cookies: ${cookies}` : ' — cookies: assenti'}`
+            );
 
-    return {
-        title,
-        url: canonicalUrl,
-        duration: Number(output.duration) || null,
-        uploader: String(output.channel || output.uploader || '').trim() || null
-    };
+            let output = await youtubeDl(url, attempt.flags);
+
+            if (typeof output === 'string') {
+                output = JSON.parse(output.trim());
+            }
+
+            if (Array.isArray(output?.entries)) {
+                output = output.entries.find(Boolean);
+            }
+
+            if (!output || typeof output !== 'object') {
+                throw new Error('yt-dlp non ha restituito metadati utilizzabili.');
+            }
+
+            const title = String(output.title || '').trim();
+            const canonicalUrl = String(
+                output.webpage_url ||
+                output.original_url ||
+                url
+            ).trim();
+
+            if (!title) {
+                throw new Error('Non riesco a recuperare il titolo del video.');
+            }
+
+            console.log(
+                `[LIBRARY ADMIN] inspectUrl ${attempt.name} riuscito: ${title}`
+            );
+
+            return {
+                title,
+                url: canonicalUrl,
+                duration: Number(output.duration) || null,
+                uploader: String(
+                    output.channel ||
+                    output.uploader ||
+                    ''
+                ).trim() || null
+            };
+        } catch (err) {
+            lastError = err;
+
+            console.warn(
+                `[LIBRARY ADMIN] inspectUrl ${attempt.name} fallito:`,
+                err?.stderr || err?.message || err
+            );
+        }
+    }
+
+    throw lastError || new Error(
+        'Impossibile recuperare i metadati del video.'
+    );
 }
 
 function baseCatalog() {
@@ -696,8 +783,8 @@ async function handleLibraryAdminCommand(interaction, { refreshHubs } = {}) {
     } catch (err) {
         console.error(`[LIBRARY ADMIN] ${interaction.commandName}:`, err);
         const message = `❌ ${err?.message || 'Operazione non riuscita.'}`;
-        if (interaction.deferred || interaction.replied) await interaction.editReply(message).catch(() => {});
-        else await interaction.reply(ephemeral(message)).catch(() => {});
+        if (interaction.deferred || interaction.replied) await interaction.editReply(message).catch(() => { });
+        else await interaction.reply(ephemeral(message)).catch(() => { });
     }
     return true;
 }
@@ -745,8 +832,8 @@ async function handleLibraryAdminButton(interaction, { refreshHubs } = {}) {
         }
     } catch (err) {
         console.error('[LIBRARY ADMIN BUTTON]', err);
-        if (interaction.deferred || interaction.replied) await interaction.editReply(`❌ ${err.message}`).catch(() => {});
-        else await interaction.reply(ephemeral(`❌ ${err.message}`)).catch(() => {});
+        if (interaction.deferred || interaction.replied) await interaction.editReply(`❌ ${err.message}`).catch(() => { });
+        else await interaction.reply(ephemeral(`❌ ${err.message}`)).catch(() => { });
     }
     return true;
 }
